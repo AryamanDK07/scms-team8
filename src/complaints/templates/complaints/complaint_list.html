@@ -1,0 +1,52 @@
+
+{% extends "complaints/base.html" %}
+
+{% block title %}My Complaints | SCMS{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h1>My Complaints</h1>
+    <p class="muted">
+        Submit a complaint and track its progress using its reference ID.
+    </p>
+    <a class="button" href="{% url 'complaints:complaint_create' %}">
+        + Submit a Complaint
+    </a>
+</div>
+
+<div class="card">
+    {% if complaints %}
+        <div style="overflow-x:auto">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Reference ID</th>
+                        <th>Title</th>
+                        <th>Category</th>
+                        <th>Status</th>
+                        <th>Submitted</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for complaint in complaints %}
+                    <tr>
+                        <td>
+                            <a href="{% url 'complaints:complaint_detail' complaint.reference_id %}">
+                                {{ complaint.reference_id }}
+                            </a>
+                        </td>
+                        <td>{{ complaint.title }}</td>
+                        <td>{{ complaint.get_category_display }}</td>
+                        <td>{{ complaint.get_status_display }}</td>
+                        <td>{{ complaint.created_at|date:"d M Y" }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    {% else %}
+        <h3>No complaints submitted yet.</h3>
+        <p>Your submitted complaints will appear here.</p>
+    {% endif %}
+</div>
+{% endblock %}
