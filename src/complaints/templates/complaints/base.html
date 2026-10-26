@@ -1,0 +1,147 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}SCMS{% endblock %}</title>
+    <style>
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #f4f7fb;
+            color: #253247;
+        }
+        header {
+            background: #173b64;
+            color: white;
+            padding: 16px 5%;
+        }
+        nav {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 18px;
+            align-items: center;
+        }
+        nav a {
+            color: white;
+            text-decoration: none;
+        }
+        .brand {
+            font-size: 22px;
+            font-weight: bold;
+            margin-right: auto;
+        }
+        main {
+            max-width: 1000px;
+            margin: 32px auto;
+            padding: 0 20px;
+        }
+        .card {
+            background: white;
+            padding: 24px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px #0000000d;
+            margin-bottom: 20px;
+        }
+        .button {
+            display: inline-block;
+            background: #1769aa;
+            color: white;
+            padding: 10px 16px;
+            border: 0;
+            border-radius: 5px;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        input, textarea, select {
+            box-sizing: border-box;
+            width: 100%;
+            max-width: 650px;
+            padding: 10px;
+            margin-top: 6px;
+            border: 1px solid #ccd4df;
+            border-radius: 5px;
+        }
+        label {
+            font-weight: bold;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            text-align: left;
+            padding: 12px 8px;
+            border-bottom: 1px solid #e3e8ef;
+        }
+        th {
+            background: #eef3f9;
+        }
+        .message {
+            background: #e0f5e8;
+            padding: 12px;
+            border-radius: 5px;
+            margin-bottom: 16px;
+        }
+        .muted {
+            color: #68778b;
+        }
+        .errorlist {
+            color: #b42318;
+        }
+        .logout-form {
+            margin: 0;
+        }
+        .logout-form button {
+            background: transparent;
+            border: 1px solid #ffffff80;
+            color: white;
+            padding: 7px 10px;
+            cursor: pointer;
+            border-radius: 5px;
+        }
+        @media (max-width: 650px) {
+            .card { padding: 16px; }
+            table { font-size: 13px; }
+            th, td { padding: 8px 4px; }
+        }
+    </style>
+</head>
+<body>
+<header>
+    <nav>
+        <a class="brand" href="{% url 'complaints:my_complaints' %}">
+            SCMS
+        </a>
+
+        {% if user.is_authenticated %}
+            <a href="{% url 'complaints:my_complaints' %}">
+                My Complaints
+            </a>
+            <a href="{% url 'complaints:complaint_create' %}">
+                Submit Complaint
+            </a>
+            <form class="logout-form"
+                  method="post"
+                  action="{% url 'logout' %}">
+                {% csrf_token %}
+                <button type="submit">Log out</button>
+            </form>
+        {% else %}
+            <a href="{% url 'login' %}">Log in</a>
+        {% endif %}
+    </nav>
+</header>
+
+<main>
+    {% if messages %}
+        {% for message in messages %}
+            <div class="message">{{ message }}</div>
+        {% endfor %}
+    {% endif %}
+
+    {% block content %}{% endblock %}
+</main>
+</body>
+</html>

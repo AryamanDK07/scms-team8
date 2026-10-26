@@ -1,0 +1,80 @@
+
+{% extends "complaints/base.html" %}
+
+{% block title %}Complaint Details | SCMS{% endblock %}
+
+{% block content %}
+<div class="card">
+    <a href="{% url 'complaints:my_complaints' %}">
+        &larr; Back to My Complaints
+    </a>
+
+    <h1>{{ complaint.title }}</h1>
+
+    <p>
+        <strong>Reference ID:</strong>
+        {{ complaint.reference_id }}
+    </p>
+
+    <p>
+        <strong>Status:</strong>
+        {{ complaint.get_status_display }}
+    </p>
+
+    <p>
+        <strong>Category:</strong>
+        {{ complaint.get_category_display }}
+    </p>
+
+    <p>
+        <strong>Priority:</strong>
+        {{ complaint.get_priority_display }}
+    </p>
+
+    <p>
+        <strong>Department:</strong>
+        {% if complaint.assigned_department %}
+            {{ complaint.assigned_department.name }}
+        {% else %}
+            Not yet assigned
+        {% endif %}
+    </p>
+
+    <p>
+        <strong>Submitted:</strong>
+        {{ complaint.created_at|date:"d M Y, H:i" }}
+    </p>
+
+    <p>
+        <strong>SLA deadline:</strong>
+        {% if complaint.sla_due_at %}
+            {{ complaint.sla_due_at|date:"d M Y, H:i" }}
+        {% else %}
+            Not yet set
+        {% endif %}
+    </p>
+
+    <h3>Description</h3>
+    <p style="white-space: pre-wrap">{{ complaint.description }}</p>
+</div>
+
+<div class="card">
+    <h2>Status History</h2>
+
+    {% if history %}
+        {% for event in history %}
+            <div style="padding:12px 0; border-bottom:1px solid #e3e8ef">
+                <strong>{{ event.get_new_status_display }}</strong>
+                <p class="muted">
+                    {{ event.created_at|date:"d M Y, H:i" }}
+                </p>
+                {% if event.comment %}
+                    <p>{{ event.comment }}</p>
+                {% endif %}
+            </div>
+        {% endfor %}
+    {% else %}
+        <p>No status history recorded yet.</p>
+    {% endif %}
+</div>
+{% endblock %}

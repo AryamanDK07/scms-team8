@@ -1,0 +1,27 @@
+
+{% extends "complaints/base.html" %}
+
+{% block title %}Submit Complaint | SCMS{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h1>Submit a Complaint</h1>
+    <p class="muted">
+        Provide the details below. Your complaint will receive a unique
+        reference ID after submission.
+    </p>
+
+    <form method="post">
+        {% csrf_token %}
+        {{ form.as_p }}
+
+        <button class="button" type="submit">
+            Submit Complaint
+        </button>
+
+        <a href="{% url 'complaints:my_complaints' %}">
+            Cancel
+        </a>
+    </form>
+</div>
+{% endblock %}
