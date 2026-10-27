@@ -156,3 +156,28 @@ AUTHENTICATION_BACKENDS = [
 
 SESSION_COOKIE_AGE = 30 * 60
 SESSION_SAVE_EVERY_REQUEST = True
+
+
+# Password reset (SCMS-F-004)
+# The reset link is valid for 15 minutes. Django's reset token also
+# embeds the user's current password hash and last_login, so the link
+# stops working the moment the password is changed — which is what
+# makes it single-use.
+
+PASSWORD_RESET_TIMEOUT = 15 * 60
+
+
+# E-mail delivery
+# The console backend prints the message, including the reset link,
+# to the terminal running the server. That keeps local development
+# working with no mail server; set EMAIL_BACKEND in .env to use a
+# real SMTP backend.
+
+EMAIL_BACKEND = os.getenv(
+    "EMAIL_BACKEND",
+    "django.core.mail.backends.console.EmailBackend",
+)
+DEFAULT_FROM_EMAIL = os.getenv(
+    "DEFAULT_FROM_EMAIL",
+    "no-reply@scms.local",
+)

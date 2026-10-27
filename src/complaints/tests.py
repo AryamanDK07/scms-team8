@@ -1,9 +1,12 @@
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
+from unittest.mock import patch
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.auth.tokens import PasswordResetTokenGenerator
 from django.contrib.sessions.models import Session
+from django.core import mail
 from django.test import TestCase
 from django.utils import timezone
 
@@ -279,6 +282,170 @@ class SessionExpiryTests(TestCase):
         record.save()
 
         self.assertEqual(self.client.get("/").status_code, 200)
+
+
+class PasswordResetTests(TestCase):
+    """SCMS-F-004 / TC-Auth-04: single-use link, valid 15 minutes."""
+
+    REQUEST_URL = "/accounts/password-reset/"
+    OLD_PASSWORD = "not-a-real-password"
+    NEW_PASSWORD = "Ts8-quarry-lantern"
+    IDLE_LIMIT = 15 * 60
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="complainant",
+            email="asha@example.com",
+            password=self.OLD_PASSWORD,
+        )
+
+    def request_reset(self, email="asha@example.com"):
+        return self.client.post(self.REQUEST_URL, {"email": email})
+
+    def emailed_link(self):
+        """The reset path from the message Django just sent."""
+        body = mail.outbox[0].body
+        match = re.search(r"/accounts/reset/[^\s]+/", body)
+        self.assertIsNotNone(
+            match, f"no reset link found in e-mail body:\n{body}",
+        )
+        return match.group(0)
+
+    def set_password_via(self, link, password=None):
+        """Walk the two-step confirm flow and submit a new password."""
+        redirect = self.client.get(link)
+        self.assertEqual(redirect.status_code, 302)
+
+        new = password or self.NEW_PASSWORD
+        return self.client.post(
+            redirect["Location"],
+            {"new_password1": new, "new_password2": new},
+        )
+
+    def test_link_validity_window_is_fifteen_minutes(self):
+        self.assertEqual(settings.PASSWORD_RESET_TIMEOUT, self.IDLE_LIMIT)
+
+    def test_request_sends_one_email_with_a_link(self):
+        response = self.request_reset()
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn("asha@example.com", mail.outbox[0].to)
+        self.assertRegex(mail.outbox[0].body, r"/accounts/reset/")
+
+    def test_unknown_address_sends_nothing_but_does_not_say_so(self):
+        """No account enumeration: the page looks the same either way."""
+        response = self.request_reset("nobody@example.com")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], "/accounts/password-reset/sent/")
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_link_lets_the_user_set_a_new_password(self):
+        self.request_reset()
+        self.set_password_via(self.emailed_link())
+
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(self.NEW_PASSWORD))
+        self.assertFalse(self.user.check_password(self.OLD_PASSWORD))
+
+    def test_new_password_works_at_login(self):
+        self.request_reset()
+        self.set_password_via(self.emailed_link())
+
+        self.client.post(
+            "/accounts/login/",
+            {
+                "username": "asha@example.com",
+                "password": self.NEW_PASSWORD,
+            },
+        )
+        self.assertEqual(
+            self.client.session.get("_auth_user_id"), str(self.user.pk),
+        )
+
+    def test_link_cannot_be_used_twice(self):
+        self.request_reset()
+        link = self.emailed_link()
+        self.set_password_via(link)
+
+        # Second visit, after the password has already changed.
+        self.client.logout()
+        response = self.client.get(link)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.context["validlink"])
+
+    def test_second_link_cannot_undo_the_first_reset(self):
+        """Reuse must not be possible by re-POSTing the set-password URL."""
+        self.request_reset()
+        link = self.emailed_link()
+        redirect = self.client.get(link)
+        set_password_url = redirect["Location"]
+
+        self.client.post(
+            set_password_url,
+            {
+                "new_password1": self.NEW_PASSWORD,
+                "new_password2": self.NEW_PASSWORD,
+            },
+        )
+
+        self.client.post(
+            set_password_url,
+            {
+                "new_password1": "Zq4-harbour-kettle",
+                "new_password2": "Zq4-harbour-kettle",
+            },
+        )
+
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(self.NEW_PASSWORD))
+        self.assertFalse(self.user.check_password("Zq4-harbour-kettle"))
+
+    def test_link_is_refused_after_fifteen_minutes(self):
+        self.request_reset()
+        link = self.emailed_link()
+
+        # Validate the token as though 16 minutes had passed. The
+        # token generator's clock is naive local time, so the fake
+        # "now" has to be built the same way or the comparison skews
+        # by the UTC offset.
+        sixteen_minutes_on = datetime.now() + timedelta(minutes=16)
+
+        with patch.object(
+            PasswordResetTokenGenerator,
+            "_now",
+            return_value=sixteen_minutes_on,
+        ):
+            response = self.client.get(link)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.context["validlink"])
+
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password(self.OLD_PASSWORD))
+
+    def test_link_still_works_inside_the_window(self):
+        self.request_reset()
+        link = self.emailed_link()
+
+        fourteen_minutes_on = datetime.now() + timedelta(minutes=14)
+
+        with patch.object(
+            PasswordResetTokenGenerator,
+            "_now",
+            return_value=fourteen_minutes_on,
+        ):
+            response = self.client.get(link)
+
+        self.assertEqual(response.status_code, 302)
+
+    def test_tampered_token_is_refused(self):
+        self.request_reset()
+        link = self.emailed_link()
+        tampered = link[:-6] + "aaaaa/"
+
+        response = self.client.get(tampered)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.context["validlink"])
 
 
 class RoleFixture(BaseFixture):
