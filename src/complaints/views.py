@@ -8,18 +8,7 @@ from .forms import ComplaintForm
 from .models import (
     Complaint,
     ComplaintStatusHistory,
-    Department,
 )
-
-
-CATEGORY_TO_DEPARTMENT = {
-    Complaint.Category.ACADEMIC: "academics",
-    Complaint.Category.FACILITIES: "facilities",
-    Complaint.Category.IT: "it-support",
-    Complaint.Category.HOSTEL: "hostel",
-    Complaint.Category.TRANSPORT: "transport",
-    Complaint.Category.OTHER: "general",
-}
 
 
 @login_required
@@ -47,20 +36,15 @@ def complaint_create(request):
             complaint = form.save(commit=False)
             complaint.submitted_by = request.user
 
-            department_code = CATEGORY_TO_DEPARTMENT.get(
-                complaint.category,
-                "general",
+            category = complaint.category
+            department = (
+                category.department
+                if category.department.is_active
+                else None
             )
 
-            department = Department.objects.filter(
-                code=department_code,
-                is_active=True,
-            ).first()
-
             complaint.assigned_department = department
-            complaint.sla_due_at = calculate_sla_deadline(
-            complaint.priority
-)
+            complaint.sla_due_at = calculate_sla_deadline(category)
             complaint.save()
 
             ComplaintStatusHistory.objects.create(

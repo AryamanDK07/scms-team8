@@ -61,8 +61,8 @@ complaint stands.
 | Document | Status |
 |----------|--------|
 | Software Requirements Specification (SRS) | v1.0 — submitted |
-| Software Architecture Document (SAD) | Not started |
-| Test Plan | Not started |
+| Software Architecture Document (SAD) | v1.0 — submitted |
+| Test Plan | v1.0 — submitted |
 
 The SRS defines 28 functional requirements, 7 non-functional
 requirements and 7 security requirements, with a full requirements
