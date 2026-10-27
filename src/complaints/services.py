@@ -45,6 +45,68 @@ def calculate_sla_deadline(category, start_time=None):
     return start + timedelta(hours=hours)
 
 
+def priority_for(category):
+    """The category's default priority (SCMS-F-013).
+
+    The priority matrix lives on the Category row as master data
+    (SCMS-F-023), so changing how a category is triaged needs no
+    code change. A category with nothing set falls back to Medium
+    rather than leaving the complaint without a priority.
+    """
+    return (
+        getattr(category, "default_priority", None)
+        or Complaint.Priority.MEDIUM
+    )
+
+
+def override_priority(
+    complaint, priority, actor, reason, source_ip=None,
+):
+    """Depart from the matrix priority, with the change recorded.
+
+    SCMS-F-013 requires the old and the new value to be logged. The
+    reason is always mandatory: every override is a deliberate
+    departure from the configured matrix and needs to say why.
+    """
+    if not reason.strip():
+        raise ValueError(
+            "A reason is required when overriding priority "
+            "(SCMS-F-013)."
+        )
+
+    if priority == complaint.priority:
+        raise ValueError(
+            "The complaint already holds that priority."
+        )
+
+    labels = dict(Complaint.Priority.choices)
+    old_priority = complaint.priority
+
+    with transaction.atomic():
+        complaint.priority = priority
+        complaint.save(update_fields=["priority", "updated_at"])
+
+        # The audit table is shaped around status transitions, so a
+        # priority change carries the same status on both sides and
+        # states the before/after values in the comment. Generalising
+        # the audit row to arbitrary field changes belongs to T8-34.
+        ComplaintStatusHistory.objects.create(
+            complaint=complaint,
+            old_status=complaint.status,
+            new_status=complaint.status,
+            changed_by=actor,
+            source_ip=source_ip,
+            comment=(
+                f"Priority changed from "
+                f"{labels.get(old_priority, old_priority)} to "
+                f"{labels.get(priority, priority)}. "
+                f"Reason: {reason.strip()}"
+            ),
+        )
+
+    return complaint
+
+
 def eligible_agents(complaint):
     """Support Agents who may be given this complaint (SCMS-F-012).
 

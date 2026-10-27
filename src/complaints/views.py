@@ -4,14 +4,18 @@ from django.contrib.auth.decorators import login_required
 from django.shortcuts import get_object_or_404, redirect, render
 from .services import calculate_sla_deadline
 
-from .forms import AssignComplaintForm, ComplaintForm
+from .forms import (
+    AssignComplaintForm,
+    ComplaintForm,
+    PriorityOverrideForm,
+)
 from .models import (
     Complaint,
     ComplaintStatusHistory,
 )
 from .permissions import require_complaint_access, role_required
 from .roles import Role, STAFF_ROLES, get_department, get_role
-from .services import assign_complaint
+from .services import assign_complaint, override_priority, priority_for
 
 
 @login_required
@@ -47,6 +51,10 @@ def complaint_create(request):
             )
 
             complaint.assigned_department = department
+
+            # SCMS-F-013: priority comes from the category's matrix,
+            # not from the complainant.
+            complaint.priority = priority_for(category)
             complaint.sla_due_at = calculate_sla_deadline(category)
             complaint.save()
 
@@ -166,6 +174,52 @@ def complaint_assign(request, reference_id):
     return render(
         request,
         "complaints/complaint_assign.html",
+        {"complaint": complaint, "form": form},
+    )
+
+
+@role_required(Role.DEPARTMENT_ADMIN, Role.SYSTEM_ADMIN)
+def complaint_priority(request, reference_id):
+    """Override the matrix priority, with a reason (SCMS-F-013)."""
+    complaint = get_object_or_404(
+        Complaint.objects.select_related(
+            "assigned_department", "category",
+        ),
+        reference_id=reference_id,
+    )
+
+    require_complaint_access(complaint, request.user, write=True)
+
+    if request.method == "POST":
+        form = PriorityOverrideForm(request.POST, complaint=complaint)
+
+        if form.is_valid():
+            previous = complaint.get_priority_display()
+
+            override_priority(
+                complaint,
+                priority=form.cleaned_data["priority"],
+                actor=request.user,
+                reason=form.cleaned_data["reason"],
+                source_ip=request.META.get("REMOTE_ADDR"),
+            )
+
+            messages.success(
+                request,
+                f"{complaint.reference_id} priority changed from "
+                f"{previous} to {complaint.get_priority_display()}.",
+            )
+
+            return redirect(
+                "complaints:complaint_detail",
+                reference_id=complaint.reference_id,
+            )
+    else:
+        form = PriorityOverrideForm(complaint=complaint)
+
+    return render(
+        request,
+        "complaints/complaint_priority.html",
         {"complaint": complaint, "form": form},
     )
 

@@ -38,6 +38,10 @@
               <a href="{% url 'complaints:complaint_assign' complaint.reference_id %}">
                 {% if complaint.assigned_to %}Reassign{% else %}Assign{% endif %}
               </a>
+              &middot;
+              <a href="{% url 'complaints:complaint_priority' complaint.reference_id %}">
+                Priority
+              </a>
             </td>
           {% endif %}
         </tr>

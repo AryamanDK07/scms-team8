@@ -1,0 +1,50 @@
+
+{% extends "complaints/base.html" %}
+
+{% block title %}Priority: {{ complaint.reference_id }} | SCMS{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h1>Change priority for {{ complaint.reference_id }}</h1>
+
+    <p class="muted">{{ complaint.title }}</p>
+
+    <p>
+        Currently <strong>{{ complaint.get_priority_display }}</strong>.
+        The default for {{ complaint.category.name }} is
+        <strong>{{ complaint.category.get_default_priority_display }}</strong>,
+        set in the category's priority matrix.
+    </p>
+
+    <form method="post">
+        {% csrf_token %}
+
+        {% for error in form.non_field_errors %}
+            <p class="errorlist">{{ error }}</p>
+        {% endfor %}
+
+        {% for field in form %}
+            <p>
+                {{ field.label_tag }}
+                {{ field }}
+
+                {% if field.help_text %}
+                    <span class="muted">{{ field.help_text }}</span>
+                {% endif %}
+
+                {% for error in field.errors %}
+                    <span class="errorlist">{{ error }}</span>
+                {% endfor %}
+            </p>
+        {% endfor %}
+
+        <button type="submit" class="button">Change priority</button>
+    </form>
+
+    <p class="muted">
+        <a href="{% url 'complaints:complaint_detail' complaint.reference_id %}">
+            Back to complaint
+        </a>
+    </p>
+</div>
+{% endblock %}

@@ -7,6 +7,22 @@ from django.dispatch import receiver
 from .roles import Role
 
 
+class ComplaintPriority(models.TextChoices):
+    """The four priorities in the SRS priority matrix (SCMS-F-013).
+
+    Defined at module level because both Category (which holds the
+    default for its complaints) and Complaint (which holds the
+    actual value) need it, and Category is declared first.
+    Complaint.Priority aliases this, so existing references keep
+    working.
+    """
+
+    LOW = "LOW", "Low"
+    MEDIUM = "MEDIUM", "Medium"
+    HIGH = "HIGH", "High"
+    CRITICAL = "CRITICAL", "Critical"
+
+
 class Department(models.Model):
     name = models.CharField(max_length=100, unique=True)
     code = models.SlugField(max_length=20, unique=True)
@@ -44,7 +60,8 @@ class Category(models.Model):
     )
     default_priority = models.CharField(
         max_length=10,
-        default="MEDIUM",
+        choices=ComplaintPriority.choices,
+        default=ComplaintPriority.MEDIUM,
         help_text="Default priority from the priority matrix (SCMS-F-013).",
     )
     is_active = models.BooleanField(default=True)
@@ -113,11 +130,8 @@ class ReferenceSequence(models.Model):
 
 class Complaint(models.Model):
 
-    class Priority(models.TextChoices):
-        LOW = "LOW", "Low"
-        MEDIUM = "MEDIUM", "Medium"
-        HIGH = "HIGH", "High"
-        CRITICAL = "CRITICAL", "Critical"
+    #: Alias so Complaint.Priority.* keeps resolving.
+    Priority = ComplaintPriority
 
     class Status(models.TextChoices):
         OPEN = "OPEN", "Open"
