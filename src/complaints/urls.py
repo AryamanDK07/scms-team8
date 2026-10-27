@@ -29,4 +29,9 @@ urlpatterns = [
         views.complaint_detail,
         name="complaint_detail",
     ),
+    path(
+        "<ref:reference_id>/assign/",
+        views.complaint_assign,
+        name="complaint_assign",
+    ),
 ]

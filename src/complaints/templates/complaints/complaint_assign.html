@@ -1,0 +1,67 @@
+
+{% extends "complaints/base.html" %}
+
+{% block title %}Assign {{ complaint.reference_id }} | SCMS{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h1>
+        {% if complaint.assigned_to %}Reassign{% else %}Assign{% endif %}
+        {{ complaint.reference_id }}
+    </h1>
+
+    <p class="muted">
+        {{ complaint.title }} &mdash;
+        {{ complaint.assigned_department.name|default:"no department" }}
+    </p>
+
+    {% if complaint.assigned_to %}
+        <p>
+            Currently with <strong>{{ complaint.assigned_to }}</strong>.
+            A reason is required to move it.
+        </p>
+    {% endif %}
+
+    {% if not form.fields.agent.queryset %}
+        <p class="errorlist">
+            There are no active Support Agents in
+            {{ complaint.assigned_department.name|default:"this department" }},
+            so this complaint cannot be assigned yet. An administrator
+            needs to give an agent that department first.
+        </p>
+    {% else %}
+        <form method="post">
+            {% csrf_token %}
+
+            {% for error in form.non_field_errors %}
+                <p class="errorlist">{{ error }}</p>
+            {% endfor %}
+
+            {% for field in form %}
+                <p>
+                    {{ field.label_tag }}
+                    {{ field }}
+
+                    {% if field.help_text %}
+                        <span class="muted">{{ field.help_text }}</span>
+                    {% endif %}
+
+                    {% for error in field.errors %}
+                        <span class="errorlist">{{ error }}</span>
+                    {% endfor %}
+                </p>
+            {% endfor %}
+
+            <button type="submit" class="button">
+                {% if complaint.assigned_to %}Reassign{% else %}Assign{% endif %}
+            </button>
+        </form>
+    {% endif %}
+
+    <p class="muted">
+        <a href="{% url 'complaints:complaint_detail' complaint.reference_id %}">
+            Back to complaint
+        </a>
+    </p>
+</div>
+{% endblock %}

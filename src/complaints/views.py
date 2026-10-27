@@ -4,13 +4,14 @@ from django.contrib.auth.decorators import login_required
 from django.shortcuts import get_object_or_404, redirect, render
 from .services import calculate_sla_deadline
 
-from .forms import ComplaintForm
+from .forms import AssignComplaintForm, ComplaintForm
 from .models import (
     Complaint,
     ComplaintStatusHistory,
 )
 from .permissions import require_complaint_access, role_required
 from .roles import Role, STAFF_ROLES, get_department, get_role
+from .services import assign_complaint
 
 
 @login_required
@@ -121,6 +122,54 @@ def complaint_detail(request, reference_id):
     )
 
 
+@role_required(Role.DEPARTMENT_ADMIN, Role.SYSTEM_ADMIN)
+def complaint_assign(request, reference_id):
+    """Assign or reassign a complaint to an agent (SCMS-F-012).
+
+    Agents cannot reach this: deciding who owns work belongs to the
+    Department Admin for that department, or a System Admin.
+    """
+    complaint = get_object_or_404(
+        Complaint.objects.select_related(
+            "assigned_department", "assigned_to", "category",
+        ),
+        reference_id=reference_id,
+    )
+
+    require_complaint_access(complaint, request.user, write=True)
+
+    if request.method == "POST":
+        form = AssignComplaintForm(request.POST, complaint=complaint)
+
+        if form.is_valid():
+            assign_complaint(
+                complaint,
+                agent=form.cleaned_data["agent"],
+                actor=request.user,
+                reason=form.cleaned_data["reason"],
+                source_ip=request.META.get("REMOTE_ADDR"),
+            )
+
+            messages.success(
+                request,
+                f"{complaint.reference_id} assigned to "
+                f"{form.cleaned_data['agent'].get_username()}.",
+            )
+
+            return redirect(
+                "complaints:complaint_detail",
+                reference_id=complaint.reference_id,
+            )
+    else:
+        form = AssignComplaintForm(complaint=complaint)
+
+    return render(
+        request,
+        "complaints/complaint_assign.html",
+        {"complaint": complaint, "form": form},
+    )
+
+
 @role_required(*STAFF_ROLES)
 def department_queue(request):
     """Staff queue, scoped by role (SCMS-F-003, SCMS-SR-003).
@@ -149,5 +198,8 @@ def department_queue(request):
         {
             "complaints": complaints.order_by("sla_due_at"),
             "role": role,
+            "can_assign": role in (
+                Role.DEPARTMENT_ADMIN, Role.SYSTEM_ADMIN,
+            ),
         },
     )
