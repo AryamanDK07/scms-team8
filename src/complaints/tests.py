@@ -17,7 +17,12 @@ from .models import (
     Department,
     SubCategory,
 )
-from .services import calculate_sla_deadline, can_reopen
+from .services import (
+    assign_complaint,
+    calculate_sla_deadline,
+    can_reopen,
+    eligible_agents,
+)
 
 
 class BaseFixture(TestCase):
@@ -701,6 +706,208 @@ class RoutingFlowTests(BaseFixture):
         entry = complaint.status_history.get()
         self.assertEqual(entry.new_status, Complaint.Status.OPEN)
         self.assertIn(self.department.name, entry.comment)
+
+
+class AssignmentTests(BaseFixture):
+    """SCMS-F-012 / TC-Route-02: assign, reassign, reason recorded."""
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.estates = Department.objects.create(
+            name="Estates", code="estates",
+        )
+
+        self.agent = self.make_staff(
+            "agent", Role.SUPPORT_AGENT, self.department,
+        )
+        self.other_agent = self.make_staff(
+            "agent2", Role.SUPPORT_AGENT, self.department,
+        )
+        self.estates_agent = self.make_staff(
+            "estatesagent", Role.SUPPORT_AGENT, self.estates,
+        )
+        self.admin = self.make_staff(
+            "itadmin", Role.DEPARTMENT_ADMIN, self.department,
+        )
+        self.estates_admin = self.make_staff(
+            "estatesadmin", Role.DEPARTMENT_ADMIN, self.estates,
+        )
+
+        self.complaint = self.make_complaint(
+            assigned_department=self.department,
+        )
+
+    def make_staff(self, username, role, department):
+        user = get_user_model().objects.create_user(
+            username=username, password="not-a-real-password",
+        )
+        profile = user.profile
+        profile.role = role
+        profile.department = department
+        profile.save()
+        return user
+
+    def url(self, complaint=None):
+        target = complaint or self.complaint
+        return f"/{target.reference_id}/assign/"
+
+    def post_assign(self, agent, reason="", complaint=None):
+        return self.client.post(
+            self.url(complaint),
+            {"agent": agent.pk, "reason": reason},
+        )
+
+    # --- the service -------------------------------------------------
+
+    def test_first_assignment_needs_no_reason(self):
+        assign_complaint(self.complaint, self.agent, actor=self.admin)
+        self.complaint.refresh_from_db()
+        self.assertEqual(self.complaint.assigned_to, self.agent)
+
+    def test_first_assignment_moves_status_to_assigned(self):
+        assign_complaint(self.complaint, self.agent, actor=self.admin)
+        self.complaint.refresh_from_db()
+        self.assertEqual(self.complaint.status, Complaint.Status.ASSIGNED)
+
+    def test_reassignment_without_a_reason_is_blocked(self):
+        assign_complaint(self.complaint, self.agent, actor=self.admin)
+
+        with self.assertRaises(ValueError):
+            assign_complaint(
+                self.complaint, self.other_agent, actor=self.admin,
+            )
+
+        self.complaint.refresh_from_db()
+        self.assertEqual(self.complaint.assigned_to, self.agent)
+
+    def test_whitespace_does_not_count_as_a_reason(self):
+        assign_complaint(self.complaint, self.agent, actor=self.admin)
+
+        with self.assertRaises(ValueError):
+            assign_complaint(
+                self.complaint,
+                self.other_agent,
+                actor=self.admin,
+                reason="   \n  ",
+            )
+
+    def test_reason_appears_in_the_audit_trail(self):
+        assign_complaint(self.complaint, self.agent, actor=self.admin)
+        assign_complaint(
+            self.complaint,
+            self.other_agent,
+            actor=self.admin,
+            reason="Original agent is on leave",
+        )
+
+        latest = self.complaint.status_history.first()
+        self.assertIn("Original agent is on leave", latest.comment)
+        self.assertIn("agent2", latest.comment)
+        self.assertEqual(latest.changed_by, self.admin)
+
+    def test_reassignment_does_not_rewind_work_in_progress(self):
+        assign_complaint(self.complaint, self.agent, actor=self.admin)
+        Complaint.objects.filter(pk=self.complaint.pk).update(
+            status=Complaint.Status.IN_PROGRESS,
+        )
+        self.complaint.refresh_from_db()
+
+        assign_complaint(
+            self.complaint,
+            self.other_agent,
+            actor=self.admin,
+            reason="Workload rebalance",
+        )
+
+        self.complaint.refresh_from_db()
+        self.assertEqual(
+            self.complaint.status, Complaint.Status.IN_PROGRESS,
+        )
+
+    def test_eligible_agents_are_scoped_to_the_department(self):
+        agents = eligible_agents(self.complaint)
+        self.assertIn(self.agent, agents)
+        self.assertNotIn(self.estates_agent, agents)
+
+    def test_unrouted_complaint_has_no_eligible_agents(self):
+        unrouted = self.make_complaint(assigned_department=None)
+        self.assertFalse(eligible_agents(unrouted).exists())
+
+    def test_inactive_agent_is_not_eligible(self):
+        self.agent.is_active = False
+        self.agent.save()
+        self.assertNotIn(self.agent, eligible_agents(self.complaint))
+
+    # --- the view ----------------------------------------------------
+
+    def test_department_admin_can_assign(self):
+        self.client.force_login(self.admin)
+        response = self.post_assign(self.agent)
+
+        self.assertEqual(response.status_code, 302)
+        self.complaint.refresh_from_db()
+        self.assertEqual(self.complaint.assigned_to, self.agent)
+
+    def test_view_blocks_reassignment_with_no_reason(self):
+        assign_complaint(self.complaint, self.agent, actor=self.admin)
+
+        self.client.force_login(self.admin)
+        response = self.post_assign(self.other_agent)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("reason", response.context["form"].errors)
+
+        self.complaint.refresh_from_db()
+        self.assertEqual(self.complaint.assigned_to, self.agent)
+
+    def test_view_accepts_reassignment_with_a_reason(self):
+        assign_complaint(self.complaint, self.agent, actor=self.admin)
+
+        self.client.force_login(self.admin)
+        response = self.post_assign(
+            self.other_agent, reason="Agent reallocated to urgent work",
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.complaint.refresh_from_db()
+        self.assertEqual(self.complaint.assigned_to, self.other_agent)
+
+    def test_agent_cannot_assign(self):
+        self.client.force_login(self.agent)
+        self.assertEqual(self.client.get(self.url()).status_code, 403)
+
+    def test_complainant_cannot_assign(self):
+        self.client.force_login(self.user)
+        self.assertEqual(self.client.get(self.url()).status_code, 403)
+
+    def test_admin_of_another_department_cannot_assign(self):
+        self.client.force_login(self.estates_admin)
+        self.assertEqual(self.client.get(self.url()).status_code, 403)
+
+    def test_agent_from_another_department_is_not_offered(self):
+        self.client.force_login(self.admin)
+        response = self.client.get(self.url())
+        choices = response.context["form"].fields["agent"].queryset
+        self.assertNotIn(self.estates_agent, choices)
+
+    def test_assigning_to_the_current_owner_is_rejected(self):
+        assign_complaint(self.complaint, self.agent, actor=self.admin)
+
+        self.client.force_login(self.admin)
+        response = self.post_assign(self.agent, reason="No change intended")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("agent", response.context["form"].errors)
+
+    def test_assignment_records_the_source_ip(self):
+        """Supports SCMS-F-027: the audit row names where it came from."""
+        self.client.force_login(self.admin)
+        self.post_assign(self.agent)
+
+        entry = self.complaint.status_history.first()
+        self.assertIsNotNone(entry.source_ip)
 
 
 class RoleFixture(BaseFixture):

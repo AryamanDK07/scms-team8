@@ -1,7 +1,9 @@
 from django import forms
+from django.contrib.auth import get_user_model
 from django.contrib.auth.forms import AuthenticationForm
 
 from .models import Category, Complaint, SubCategory
+from .services import eligible_agents
 
 
 class EmailLoginForm(AuthenticationForm):
@@ -28,6 +30,71 @@ class EmailLoginForm(AuthenticationForm):
             "Please try again."
         ),
     }
+
+
+class AssignComplaintForm(forms.Form):
+    """Assign or reassign a complaint to an agent (SCMS-F-012).
+
+    The reason is mandatory on a reassignment and optional on a
+    first assignment, which is the distinction the requirement
+    draws: there is no prior owner to account for the first time.
+    """
+
+    agent = forms.ModelChoiceField(
+        queryset=get_user_model().objects.none(),
+        empty_label="Select an agent",
+        label="Support Agent",
+    )
+    reason = forms.CharField(
+        required=False,
+        widget=forms.Textarea(attrs={
+            "rows": 3,
+            "placeholder": "Why is this being reassigned?",
+        }),
+        help_text="Required when reassigning.",
+    )
+
+    def __init__(self, *args, complaint=None, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.complaint = complaint
+        self.is_reassignment = (
+            complaint is not None and complaint.assigned_to_id is not None
+        )
+
+        if complaint is not None:
+            self.fields["agent"].queryset = eligible_agents(complaint)
+
+        if self.is_reassignment:
+            self.fields["reason"].required = True
+            self.fields["reason"].help_text = (
+                "Recorded in the audit trail against this complaint."
+            )
+
+    def clean_agent(self):
+        """Reassigning to the current owner is a no-op, not a change."""
+        agent = self.cleaned_data["agent"]
+
+        if (
+            self.complaint is not None
+            and self.complaint.assigned_to_id == agent.pk
+        ):
+            raise forms.ValidationError(
+                f"{agent.get_username()} already has this complaint. "
+                f"Choose a different agent."
+            )
+
+        return agent
+
+    def clean_reason(self):
+        reason = self.cleaned_data.get("reason", "")
+
+        if self.is_reassignment and not reason.strip():
+            raise forms.ValidationError(
+                "Give a reason for the reassignment."
+            )
+
+        return reason
 
 
 class ComplaintForm(forms.ModelForm):
