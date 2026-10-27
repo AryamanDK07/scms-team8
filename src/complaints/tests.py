@@ -1,7 +1,9 @@
 import re
 from datetime import timedelta
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.sessions.models import Session
 from django.test import TestCase
 from django.utils import timezone
 
@@ -159,6 +161,124 @@ class RoutingTests(BaseFixture):
         self.category.save()
         self.category.refresh_from_db()
         self.assertEqual(self.category.department, other)
+
+
+class EmailLoginTests(TestCase):
+    """SCMS-F-002 / TC-Auth-02: sign in with e-mail and password."""
+
+    LOGIN_URL = "/accounts/login/"
+    PASSWORD = "not-a-real-password"
+
+    def setUp(self):
+        self.User = get_user_model()
+        self.user = self.User.objects.create_user(
+            username="complainant",
+            email="asha@example.com",
+            password=self.PASSWORD,
+        )
+
+    def login(self, email, password=None):
+        return self.client.post(
+            self.LOGIN_URL,
+            {"username": email, "password": password or self.PASSWORD},
+        )
+
+    def logged_in_as(self):
+        return self.client.session.get("_auth_user_id")
+
+    def test_valid_email_and_password_creates_session(self):
+        response = self.login("asha@example.com")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.logged_in_as(), str(self.user.pk))
+
+    def test_email_is_case_insensitive(self):
+        self.login("Asha@Example.COM")
+        self.assertEqual(self.logged_in_as(), str(self.user.pk))
+
+    def test_surrounding_whitespace_is_ignored(self):
+        self.login("  asha@example.com  ")
+        self.assertEqual(self.logged_in_as(), str(self.user.pk))
+
+    def test_wrong_password_is_refused(self):
+        self.login("asha@example.com", password="wrong-password")
+        self.assertIsNone(self.logged_in_as())
+
+    def test_unknown_email_is_refused(self):
+        self.login("nobody@example.com")
+        self.assertIsNone(self.logged_in_as())
+
+    def test_username_is_not_accepted_in_place_of_email(self):
+        """The form validates the field as an e-mail address."""
+        response = self.login("complainant")
+        self.assertIsNone(self.logged_in_as())
+        self.assertFormError(
+            response.context["form"],
+            "username",
+            "Enter a valid email address.",
+        )
+
+    def test_deactivated_account_cannot_log_in(self):
+        """Supports SCMS-F-024: deactivation takes effect at login."""
+        self.user.is_active = False
+        self.user.save()
+        self.login("asha@example.com")
+        self.assertIsNone(self.logged_in_as())
+
+    def test_duplicate_email_refuses_both_accounts(self):
+        """An ambiguous e-mail must never resolve to either account."""
+        self.User.objects.create_user(
+            username="imposter",
+            email="asha@example.com",
+            password=self.PASSWORD,
+        )
+        self.login("asha@example.com")
+        self.assertIsNone(self.logged_in_as())
+
+
+class SessionExpiryTests(TestCase):
+    """SCMS-F-002 / TC-Auth-02: 30 minutes of inactivity ends it."""
+
+    IDLE_LIMIT = 30 * 60
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="complainant",
+            email="asha@example.com",
+            password="not-a-real-password",
+        )
+
+    def test_idle_window_is_thirty_minutes(self):
+        self.assertEqual(settings.SESSION_COOKIE_AGE, self.IDLE_LIMIT)
+
+    def test_expiry_is_measured_from_last_request(self):
+        """Without this, the 30 minutes would run from login."""
+        self.assertTrue(settings.SESSION_SAVE_EVERY_REQUEST)
+
+    def test_request_after_idle_window_is_no_longer_authenticated(self):
+        self.client.force_login(self.user)
+        self.assertEqual(self.client.get("/").status_code, 200)
+
+        # Age the stored session past the idle window.
+        record = Session.objects.get(
+            session_key=self.client.session.session_key,
+        )
+        record.expire_date = timezone.now() - timedelta(seconds=1)
+        record.save()
+
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/accounts/login/", response["Location"])
+
+    def test_request_inside_idle_window_stays_authenticated(self):
+        self.client.force_login(self.user)
+
+        record = Session.objects.get(
+            session_key=self.client.session.session_key,
+        )
+        record.expire_date = timezone.now() + timedelta(minutes=5)
+        record.save()
+
+        self.assertEqual(self.client.get("/").status_code, 200)
 
 
 class RoleFixture(BaseFixture):
