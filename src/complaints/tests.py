@@ -10,7 +10,13 @@ from django.core import mail
 from django.test import TestCase
 from django.utils import timezone
 
-from .models import Category, Complaint, ComplaintStatusHistory, Department
+from .models import (
+    Category,
+    Complaint,
+    ComplaintStatusHistory,
+    Department,
+    SubCategory,
+)
 from .services import calculate_sla_deadline, can_reopen
 
 
@@ -446,6 +452,135 @@ class PasswordResetTests(TestCase):
         response = self.client.get(tampered)
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.context["validlink"])
+
+
+class LodgeComplaintTests(BaseFixture):
+    """SCMS-F-006 / TC-Lodge-01: mandatory fields, field-wise errors."""
+
+    URL = "/new/"
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.sub_category = SubCategory.objects.create(
+            name="Projector",
+            code="projector",
+            category=self.category,
+        )
+
+        # A sub-category under a different parent, for the
+        # mismatched-pair case.
+        self.other_category = Category.objects.create(
+            name="Facilities",
+            code="facilities",
+            department=self.department,
+        )
+        self.other_sub_category = SubCategory.objects.create(
+            name="Leaking Tap",
+            code="leaking-tap",
+            category=self.other_category,
+        )
+
+        profile = self.user.profile
+        profile.role = Role.COMPLAINANT
+        profile.save()
+        self.client.force_login(self.user)
+
+    def payload(self, **overrides):
+        data = {
+            "title": "Projector not working",
+            "category": self.category.pk,
+            "sub_category": self.sub_category.pk,
+            "location": "Block C, Room 302",
+            "description": "The projector in room 302 does not switch on.",
+            "priority": Complaint.Priority.MEDIUM,
+        }
+        data.update(overrides)
+        return data
+
+    def test_valid_submission_is_saved_with_every_field(self):
+        response = self.client.post(self.URL, self.payload())
+        self.assertEqual(response.status_code, 302)
+
+        complaint = Complaint.objects.get()
+        self.assertEqual(complaint.title, "Projector not working")
+        self.assertEqual(complaint.category, self.category)
+        self.assertEqual(complaint.sub_category, self.sub_category)
+        self.assertEqual(complaint.location, "Block C, Room 302")
+        self.assertEqual(complaint.submitted_by, self.user)
+
+    def assert_rejected_with_error_on(self, field, **overrides):
+        """Nothing saved, and the error sits on the named field."""
+        response = self.client.post(self.URL, self.payload(**overrides))
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(Complaint.objects.exists())
+
+        form = response.context["form"]
+        self.assertIn(
+            field,
+            form.errors,
+            f"expected an error on {field}, got {dict(form.errors)}",
+        )
+        return form
+
+    def test_subject_is_mandatory(self):
+        self.assert_rejected_with_error_on("title", title="")
+
+    def test_category_is_mandatory(self):
+        self.assert_rejected_with_error_on("category", category="")
+
+    def test_sub_category_is_mandatory(self):
+        self.assert_rejected_with_error_on("sub_category", sub_category="")
+
+    def test_location_is_mandatory(self):
+        self.assert_rejected_with_error_on("location", location="")
+
+    def test_description_is_mandatory(self):
+        self.assert_rejected_with_error_on("description", description="")
+
+    def test_description_over_two_thousand_characters_is_refused(self):
+        """The browser's maxlength is bypassable, so check the server."""
+        form = self.assert_rejected_with_error_on(
+            "description", description="x" * 2001,
+        )
+        self.assertIn("2000", str(form.errors["description"]))
+
+    def test_description_at_exactly_two_thousand_is_accepted(self):
+        response = self.client.post(
+            self.URL, self.payload(description="x" * 2000),
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(Complaint.objects.count(), 1)
+
+    def test_sub_category_from_another_category_is_refused(self):
+        form = self.assert_rejected_with_error_on(
+            "sub_category", sub_category=self.other_sub_category.pk,
+        )
+        self.assertIn(
+            "does not belong", str(form.errors["sub_category"]),
+        )
+
+    def test_several_invalid_fields_each_report_their_own_error(self):
+        response = self.client.post(
+            self.URL,
+            self.payload(title="", location="", description=""),
+        )
+
+        form = response.context["form"]
+        self.assertEqual(
+            set(form.errors),
+            {"title", "location", "description"},
+        )
+
+    def test_inactive_sub_category_is_not_offered(self):
+        self.sub_category.is_active = False
+        self.sub_category.save()
+
+        response = self.client.get(self.URL)
+        choices = response.context["form"].fields["sub_category"].queryset
+        self.assertNotIn(self.sub_category, choices)
 
 
 class RoleFixture(BaseFixture):

@@ -7,6 +7,7 @@ from .models import (
     Complaint,
     Category,
     ComplaintStatusHistory,
+    SubCategory,
 )
 from .services import calculate_sla_deadline
 
@@ -30,6 +31,8 @@ class ComplaintAdmin(admin.ModelAdmin):
         "reference_id",
         "title",
         "category",
+        "sub_category",
+        "location",
         "priority",
         "status",
         "assigned_department",
@@ -41,6 +44,7 @@ class ComplaintAdmin(admin.ModelAdmin):
 
     list_filter = (
         "category",
+        "sub_category",
         "priority",
         "status",
         "assigned_department",
@@ -51,6 +55,7 @@ class ComplaintAdmin(admin.ModelAdmin):
         "=reference_id",
         "title",
         "description",
+        "location",
         "submitted_by__username",
         "submitted_by__email",
         "assigned_to__username",
@@ -87,7 +92,12 @@ class ComplaintAdmin(admin.ModelAdmin):
             or old_priority != obj.priority
             or obj.sla_due_at is None
         ):
-            obj.sla_due_at = calculate_sla_deadline(obj.priority)
+            # The SLA comes from the category, not the priority
+            # (SCMS-F-014, ADR-06). This previously passed the
+            # priority string, which has no sla_hours attribute, so
+            # every admin-created complaint silently fell back to the
+            # default 48 hours regardless of its category.
+            obj.sla_due_at = calculate_sla_deadline(obj.category)
 
         # Record the resolution timestamp when a complaint
         # first reaches the Resolved status.
@@ -200,3 +210,13 @@ class CategoryAdmin(admin.ModelAdmin):
     )
     list_filter = ("department", "is_active")
     search_fields = ("name", "code")
+
+
+@admin.register(SubCategory)
+class SubCategoryAdmin(admin.ModelAdmin):
+    """Master data for complaint sub-categories (SCMS-F-006)."""
+
+    list_display = ("name", "code", "category", "is_active")
+    list_filter = ("category", "is_active")
+    search_fields = ("name", "code", "category__name")
+    ordering = ("category__name", "name")
