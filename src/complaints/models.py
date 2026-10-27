@@ -1,6 +1,4 @@
 
-import uuid
-
 from django.conf import settings
 from django.db import models
 
@@ -19,44 +17,85 @@ class Department(models.Model):
         return f"{self.name} ({self.code})"
 
 
-class Complaint(models.Model):
+class Category(models.Model):
+    """Master data: complaint categories.
 
-    class Category(models.TextChoices):
-        ACADEMIC = "ACADEMIC", "Academic"
-        FACILITIES = "FACILITIES", "Facilities"
-        IT = "IT", "IT Support"
-        HOSTEL = "HOSTEL", "Hostel"
-        TRANSPORT = "TRANSPORT", "Transport"
-        OTHER = "OTHER", "Other"
+    SCMS-F-023 and ADR-06 require categories, their department
+    mapping, their SLA and their default priority to be editable
+    rows rather than constants in code, so that an administrator
+    can change routing behaviour without a redeployment.
+    """
+
+    name = models.CharField(max_length=100, unique=True)
+    code = models.SlugField(max_length=30, unique=True)
+    department = models.ForeignKey(
+        Department,
+        on_delete=models.PROTECT,
+        related_name="categories",
+        help_text="Department this category is routed to (SCMS-F-011).",
+    )
+    sla_hours = models.PositiveIntegerField(
+        default=48,
+        help_text="Resolution SLA in hours for this category (SCMS-F-014).",
+    )
+    default_priority = models.CharField(
+        max_length=10,
+        default="MEDIUM",
+        help_text="Default priority from the priority matrix (SCMS-F-013).",
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["name"]
+        verbose_name_plural = "categories"
+
+    def __str__(self):
+        return self.name
+
+
+class ReferenceSequence(models.Model):
+    """Per-year counter backing the SCMS-YYYY-NNNNNN reference ID."""
+
+    year = models.PositiveIntegerField(unique=True)
+    last_number = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["-year"]
+
+    def __str__(self):
+        return f"{self.year}: {self.last_number}"
+
+
+class Complaint(models.Model):
 
     class Priority(models.TextChoices):
         LOW = "LOW", "Low"
         MEDIUM = "MEDIUM", "Medium"
         HIGH = "HIGH", "High"
-        URGENT = "URGENT", "Urgent"
+        CRITICAL = "CRITICAL", "Critical"
 
     class Status(models.TextChoices):
-        SUBMITTED = "SUBMITTED", "Submitted"
-        ACKNOWLEDGED = "ACKNOWLEDGED", "Acknowledged"
+        OPEN = "OPEN", "Open"
+        ASSIGNED = "ASSIGNED", "Assigned"
         IN_PROGRESS = "IN_PROGRESS", "In Progress"
-        WAITING_FOR_INFORMATION = (
-            "WAITING_FOR_INFORMATION",
-            "Waiting for Information",
-        )
+        PENDING_INFORMATION = "PENDING_INFORMATION", "Pending Information"
         RESOLVED = "RESOLVED", "Resolved"
         CLOSED = "CLOSED", "Closed"
-        REJECTED = "REJECTED", "Rejected"
+        REOPENED = "REOPENED", "Reopened"
 
-    reference_id = models.UUIDField(
-        default=uuid.uuid4,
+    reference_id = models.CharField(
+        max_length=20,
         unique=True,
         editable=False,
+        help_text="Format SCMS-YYYY-NNNNNN (SCMS-F-007).",
     )
     title = models.CharField(max_length=200)
-    description = models.TextField()
-    category = models.CharField(
-        max_length=30,
-        choices=Category.choices,
+    description = models.TextField(max_length=2000)
+    category = models.ForeignKey(
+        Category,
+        on_delete=models.PROTECT,
+        related_name="complaints",
     )
     priority = models.CharField(
         max_length=10,
@@ -66,7 +105,7 @@ class Complaint(models.Model):
     status = models.CharField(
         max_length=30,
         choices=Status.choices,
-        default=Status.SUBMITTED,
+        default=Status.OPEN,
     )
 
     submitted_by = models.ForeignKey(
@@ -91,20 +130,43 @@ class Complaint(models.Model):
 
     sla_due_at = models.DateTimeField(null=True, blank=True)
     resolved_at = models.DateTimeField(null=True, blank=True)
+    reopened_at = models.DateTimeField(null=True, blank=True)
+    reopen_count = models.PositiveSmallIntegerField(
+        default=0,
+        help_text="A complaint may be reopened once (SCMS-F-019).",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status"]),
+            models.Index(fields=["assigned_department"]),
+            models.Index(fields=["created_at"]),
+        ]
 
     def __str__(self):
         return f"{self.reference_id} - {self.title}"
 
+    def save(self, *args, **kwargs):
+        if not self.reference_id:
+            from .services import generate_reference_id
+
+            self.reference_id = generate_reference_id()
+        super().save(*args, **kwargs)
+
 
 class ComplaintStatusHistory(models.Model):
+    """Append-only audit trail of complaint state changes.
+
+    SCMS-F-027 and SCMS-SR-006: rows are written once and never
+    updated or deleted through the application.
+    """
+
     complaint = models.ForeignKey(
         Complaint,
-        on_delete=models.CASCADE,
+        on_delete=models.PROTECT,
         related_name="status_history",
     )
     old_status = models.CharField(
@@ -123,14 +185,30 @@ class ComplaintStatusHistory(models.Model):
         blank=True,
         related_name="complaint_status_changes",
     )
+    source_ip = models.GenericIPAddressField(null=True, blank=True)
     comment = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         ordering = ["-created_at"]
+        verbose_name_plural = "complaint status history"
 
     def __str__(self):
         return (
             f"{self.complaint.reference_id}: "
             f"{self.old_status or 'NEW'} -> {self.new_status}"
+        )
+
+    def save(self, *args, **kwargs):
+        if self.pk is not None:
+            raise ValueError(
+                "Audit rows are append-only and cannot be modified "
+                "(SCMS-SR-006)."
+            )
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValueError(
+            "Audit rows are append-only and cannot be deleted "
+            "(SCMS-SR-006)."
         )

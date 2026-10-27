@@ -5,6 +5,7 @@ from django.utils import timezone
 from .models import (
     Department,
     Complaint,
+    Category,
     ComplaintStatusHistory,
 )
 from .services import calculate_sla_deadline
@@ -183,3 +184,19 @@ class ComplaintStatusHistoryAdmin(admin.ModelAdmin):
 
     def has_delete_permission(self, request, obj=None):
         return False
+
+
+@admin.register(Category)
+class CategoryAdmin(admin.ModelAdmin):
+    """Master data for routing, SLA and default priority (SCMS-F-023)."""
+
+    list_display = (
+        "name",
+        "code",
+        "department",
+        "sla_hours",
+        "default_priority",
+        "is_active",
+    )
+    list_filter = ("department", "is_active")
+    search_fields = ("name", "code")
