@@ -1,6 +1,10 @@
 
 from django.conf import settings
 from django.db import models
+from django.db.models.signals import post_save
+from django.dispatch import receiver
+
+from .roles import Role
 
 
 class Department(models.Model):
@@ -212,3 +216,45 @@ class ComplaintStatusHistory(models.Model):
             "Audit rows are append-only and cannot be deleted "
             "(SCMS-SR-006)."
         )
+
+
+class UserProfile(models.Model):
+    """Role membership for a user (SCMS-F-003).
+
+    Every user has exactly one profile. A user without a profile
+    holds no role and is refused everything, which is the
+    deny-by-default stance required by SCMS-SR-003.
+    """
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="profile",
+    )
+    role = models.CharField(
+        max_length=20,
+        choices=Role.choices,
+        default=Role.COMPLAINANT,
+    )
+    department = models.ForeignKey(
+        Department,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="staff",
+        help_text="Required for Support Agent and Department Admin.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["user__username"]
+
+    def __str__(self):
+        return f"{self.user} ({self.get_role_display()})"
+
+
+@receiver(post_save, sender=settings.AUTH_USER_MODEL)
+def create_user_profile(sender, instance, created, **kwargs):
+    """Give every new user a Complainant profile by default."""
+    if created:
+        UserProfile.objects.get_or_create(user=instance)

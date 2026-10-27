@@ -1,0 +1,39 @@
+{% extends "complaints/base.html" %}
+
+{% block content %}
+  <h1>Complaint queue</h1>
+  <p>Showing complaints visible to your role.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Reference</th>
+        <th>Title</th>
+        <th>Category</th>
+        <th>Department</th>
+        <th>Priority</th>
+        <th>Status</th>
+        <th>SLA due</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for complaint in complaints %}
+        <tr>
+          <td>
+            <a href="{% url 'complaints:complaint_detail' complaint.reference_id %}">
+              {{ complaint.reference_id }}
+            </a>
+          </td>
+          <td>{{ complaint.title }}</td>
+          <td>{{ complaint.category.name }}</td>
+          <td>{{ complaint.assigned_department.name|default:"Unassigned" }}</td>
+          <td>{{ complaint.get_priority_display }}</td>
+          <td>{{ complaint.get_status_display }}</td>
+          <td>{{ complaint.sla_due_at|date:"d M Y H:i"|default:"-" }}</td>
+        </tr>
+      {% empty %}
+        <tr><td colspan="7">No complaints in your queue.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}
