@@ -583,6 +583,126 @@ class LodgeComplaintTests(BaseFixture):
         self.assertNotIn(self.sub_category, choices)
 
 
+class RoutingFlowTests(BaseFixture):
+    """SCMS-F-011 / TC-Route-01: lodging routes to the mapped queue.
+
+    RoutingTests above covers the mapping as master data. This covers
+    the path a real complaint takes: submitted by a complainant,
+    appearing in the right department's queue and nowhere else.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.estates = Department.objects.create(
+            name="Estates", code="estates",
+        )
+        self.sub_category = SubCategory.objects.create(
+            name="Projector", code="projector", category=self.category,
+        )
+
+        profile = self.user.profile
+        profile.role = Role.COMPLAINANT
+        profile.save()
+
+        self.it_admin = self.make_admin("itadmin", self.department)
+        self.estates_admin = self.make_admin("estatesadmin", self.estates)
+
+    def make_admin(self, username, department):
+        from .roles import Role
+
+        user = get_user_model().objects.create_user(
+            username=username, password="not-a-real-password",
+        )
+        profile = user.profile
+        profile.role = Role.DEPARTMENT_ADMIN
+        profile.department = department
+        profile.save()
+        return user
+
+    def lodge(self, category=None, sub_category=None):
+        self.client.force_login(self.user)
+        response = self.client.post("/new/", {
+            "title": "Projector not working",
+            "category": (category or self.category).pk,
+            "sub_category": (sub_category or self.sub_category).pk,
+            "location": "Block C, Room 302",
+            "description": "The projector in room 302 does not switch on.",
+            "priority": Complaint.Priority.MEDIUM,
+        })
+        self.assertEqual(response.status_code, 302)
+        self.client.logout()
+        return Complaint.objects.latest("created_at")
+
+    def queue_for(self, user):
+        self.client.force_login(user)
+        response = self.client.get("/queue/")
+        self.assertEqual(response.status_code, 200)
+        return response
+
+    def test_lodging_assigns_the_mapped_department(self):
+        complaint = self.lodge()
+        self.assertEqual(complaint.assigned_department, self.department)
+
+    def test_routing_happens_before_the_response_returns(self):
+        """The 5-second criterion: assignment is synchronous."""
+        complaint = self.lodge()
+        complaint.refresh_from_db()
+        self.assertIsNotNone(complaint.assigned_department)
+
+    def test_complaint_appears_in_the_mapped_department_queue(self):
+        complaint = self.lodge()
+        self.assertContains(
+            self.queue_for(self.it_admin), complaint.reference_id,
+        )
+
+    def test_complaint_is_absent_from_other_department_queues(self):
+        complaint = self.lodge()
+        self.assertNotContains(
+            self.queue_for(self.estates_admin), complaint.reference_id,
+        )
+
+    def test_remapping_a_category_reroutes_later_complaints(self):
+        """ADR-06: routing changes without touching code."""
+        first = self.lodge()
+        self.assertEqual(first.assigned_department, self.department)
+
+        self.category.department = self.estates
+        self.category.save()
+
+        second = self.lodge()
+        self.assertEqual(second.assigned_department, self.estates)
+
+        # The earlier complaint keeps the department it was routed to.
+        first.refresh_from_db()
+        self.assertEqual(first.assigned_department, self.department)
+
+    def test_lodging_sets_the_sla_from_the_category(self):
+        complaint = self.lodge()
+        expected = complaint.created_at + timedelta(
+            hours=self.category.sla_hours,
+        )
+        self.assertIsNotNone(complaint.sla_due_at)
+        self.assertLess(
+            abs((complaint.sla_due_at - expected).total_seconds()), 5,
+        )
+
+    def test_inactive_department_leaves_the_complaint_unassigned(self):
+        """Routing must not silently drop a complaint into a dead queue."""
+        self.department.is_active = False
+        self.department.save()
+
+        complaint = self.lodge()
+        self.assertIsNone(complaint.assigned_department)
+
+    def test_routing_is_recorded_in_the_audit_trail(self):
+        complaint = self.lodge()
+        entry = complaint.status_history.get()
+        self.assertEqual(entry.new_status, Complaint.Status.OPEN)
+        self.assertIn(self.department.name, entry.comment)
+
+
 class RoleFixture(BaseFixture):
     """Users across the four roles for authorisation tests."""
 
