@@ -134,3 +134,25 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 LOGIN_URL = "/accounts/login/"
 LOGIN_REDIRECT_URL = "/"
 LOGOUT_REDIRECT_URL = "/accounts/login/"
+
+
+# Authentication (SCMS-F-002)
+# EmailBackend signs users in on e-mail address. ModelBackend is kept
+# after it so that accounts created before this change, and superusers
+# whose e-mail address was never set, can still reach the admin site
+# with their username.
+
+AUTHENTICATION_BACKENDS = [
+    "complaints.auth_backends.EmailBackend",
+    "django.contrib.auth.backends.ModelBackend",
+]
+
+
+# Session expiry (SCMS-F-002)
+# The requirement is 30 minutes of *inactivity*, so the cookie is
+# given a 30-minute life and SESSION_SAVE_EVERY_REQUEST re-stamps it
+# on every request. An idle session therefore lapses 30 minutes after
+# the last request, not 30 minutes after login.
+
+SESSION_COOKIE_AGE = 30 * 60
+SESSION_SAVE_EVERY_REQUEST = True
