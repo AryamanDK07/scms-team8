@@ -159,3 +159,148 @@ class RoutingTests(BaseFixture):
         self.category.save()
         self.category.refresh_from_db()
         self.assertEqual(self.category.department, other)
+
+
+class RoleFixture(BaseFixture):
+    """Users across the four roles for authorisation tests."""
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.other_department = Department.objects.create(
+            name="Facilities", code="facilities",
+        )
+        self.User = get_user_model()
+
+        def make(username, role, department=None):
+            user = self.User.objects.create_user(
+                username=username, password="not-a-real-password",
+            )
+            profile = user.profile
+            profile.role = role
+            profile.department = department
+            profile.save()
+            return user
+
+        self.other_complainant = make("other", Role.COMPLAINANT)
+        self.agent = make("agent", Role.SUPPORT_AGENT, self.department)
+        self.other_agent = make(
+            "otheragent", Role.SUPPORT_AGENT, self.other_department,
+        )
+        self.dept_admin = make(
+            "deptadmin", Role.DEPARTMENT_ADMIN, self.department,
+        )
+        self.other_dept_admin = make(
+            "otherdeptadmin", Role.DEPARTMENT_ADMIN, self.other_department,
+        )
+        self.sys_admin = make("sysadmin", Role.SYSTEM_ADMIN)
+
+        self.complaint = self.make_complaint(
+            assigned_department=self.department,
+            assigned_to=self.agent,
+        )
+
+
+class ProfileTests(RoleFixture):
+    """SCMS-F-003: every user gets a role."""
+
+    def test_new_user_defaults_to_complainant(self):
+        from .roles import Role
+        fresh = self.User.objects.create_user(
+            username="fresh", password="not-a-real-password",
+        )
+        self.assertEqual(fresh.profile.role, Role.COMPLAINANT)
+
+    def test_role_and_department_persist(self):
+        from .roles import Role
+        self.assertEqual(self.agent.profile.role, Role.SUPPORT_AGENT)
+        self.assertEqual(self.agent.profile.department, self.department)
+
+
+class ObjectLevelAccessTests(RoleFixture):
+    """SCMS-SR-003 / TC-Sec-03: deny-by-default, object level."""
+
+    def test_owner_can_view(self):
+        from .permissions import can_view_complaint
+        self.assertTrue(can_view_complaint(self.user, self.complaint))
+
+    def test_other_complainant_cannot_view(self):
+        from .permissions import can_view_complaint
+        self.assertFalse(
+            can_view_complaint(self.other_complainant, self.complaint)
+        )
+
+    def test_assigned_agent_can_view(self):
+        from .permissions import can_view_complaint
+        self.assertTrue(can_view_complaint(self.agent, self.complaint))
+
+    def test_agent_from_another_department_cannot_view(self):
+        from .permissions import can_view_complaint
+        self.assertFalse(
+            can_view_complaint(self.other_agent, self.complaint)
+        )
+
+    def test_department_admin_sees_own_department_only(self):
+        from .permissions import can_view_complaint
+        self.assertTrue(can_view_complaint(self.dept_admin, self.complaint))
+        self.assertFalse(
+            can_view_complaint(self.other_dept_admin, self.complaint)
+        )
+
+    def test_system_admin_sees_everything(self):
+        from .permissions import can_view_complaint
+        self.assertTrue(can_view_complaint(self.sys_admin, self.complaint))
+
+    def test_complainant_cannot_work_own_complaint(self):
+        from .permissions import can_work_complaint
+        self.assertFalse(can_work_complaint(self.user, self.complaint))
+
+    def test_agent_can_work_assigned_complaint(self):
+        from .permissions import can_work_complaint
+        self.assertTrue(can_work_complaint(self.agent, self.complaint))
+
+    def test_user_without_profile_is_denied(self):
+        from .permissions import can_view_complaint
+        orphan = self.User.objects.create_user(
+            username="orphan", password="not-a-real-password",
+        )
+        orphan.profile.delete()
+        orphan.refresh_from_db()
+        self.assertFalse(can_view_complaint(orphan, self.complaint))
+
+
+class ViewAccessTests(RoleFixture):
+    """The URL-tampering case from TC-Sec-03, through the view."""
+
+    def url(self):
+        return f"/{self.complaint.reference_id}/"
+
+    def test_owner_gets_200(self):
+        self.client.force_login(self.user)
+        self.assertEqual(self.client.get(self.url()).status_code, 200)
+
+    def test_other_complainant_gets_403(self):
+        self.client.force_login(self.other_complainant)
+        self.assertEqual(self.client.get(self.url()).status_code, 403)
+
+    def test_agent_from_another_department_gets_403(self):
+        self.client.force_login(self.other_agent)
+        self.assertEqual(self.client.get(self.url()).status_code, 403)
+
+    def test_anonymous_is_redirected_to_login(self):
+        self.assertEqual(self.client.get(self.url()).status_code, 302)
+
+    def test_staff_cannot_lodge_complaints(self):
+        self.client.force_login(self.agent)
+        self.assertEqual(self.client.get("/new/").status_code, 403)
+
+    def test_complainant_cannot_open_staff_queue(self):
+        self.client.force_login(self.user)
+        self.assertEqual(self.client.get("/queue/").status_code, 403)
+
+    def test_agent_queue_shows_only_assigned(self):
+        self.client.force_login(self.other_agent)
+        response = self.client.get("/queue/")
+        self.assertEqual(response.status_code, 200)
+        self.assertNotContains(response, self.complaint.reference_id)

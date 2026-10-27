@@ -9,6 +9,8 @@ from .models import (
     Complaint,
     ComplaintStatusHistory,
 )
+from .permissions import require_complaint_access, role_required
+from .roles import Role, STAFF_ROLES, get_department, get_role
 
 
 @login_required
@@ -27,7 +29,7 @@ def complaint_list(request):
     )
 
 
-@login_required
+@role_required(Role.COMPLAINANT)
 def complaint_create(request):
     if request.method == "POST":
         form = ComplaintForm(request.POST)
@@ -96,10 +98,14 @@ def complaint_detail(request, reference_id):
         Complaint.objects.select_related(
             "assigned_department",
             "assigned_to",
+            "category",
         ),
         reference_id=reference_id,
-        submitted_by=request.user,
     )
+
+    # SCMS-SR-003: changing the reference ID in the URL must not
+    # expose someone else's complaint.
+    require_complaint_access(complaint, request.user)
 
     history = complaint.status_history.select_related(
         "changed_by"
@@ -111,5 +117,37 @@ def complaint_detail(request, reference_id):
         {
             "complaint": complaint,
             "history": history,
+        },
+    )
+
+
+@role_required(*STAFF_ROLES)
+def department_queue(request):
+    """Staff queue, scoped by role (SCMS-F-003, SCMS-SR-003).
+
+    An agent sees only complaints assigned to them; a Department
+    Admin sees their department; a System Admin sees everything.
+    """
+    complaints = Complaint.objects.select_related(
+        "assigned_department",
+        "assigned_to",
+        "category",
+    )
+
+    role = get_role(request.user)
+
+    if role == Role.SUPPORT_AGENT:
+        complaints = complaints.filter(assigned_to=request.user)
+    elif role == Role.DEPARTMENT_ADMIN:
+        complaints = complaints.filter(
+            assigned_department=get_department(request.user),
+        )
+
+    return render(
+        request,
+        "complaints/department_queue.html",
+        {
+            "complaints": complaints.order_by("sla_due_at"),
+            "role": role,
         },
     )
