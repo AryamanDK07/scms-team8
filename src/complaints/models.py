@@ -58,6 +58,46 @@ class Category(models.Model):
         return self.name
 
 
+class SubCategory(models.Model):
+    """Master data: a narrower classification within a Category.
+
+    SCMS-F-006 captures a sub-category alongside the category.
+    Like Category, these are editable rows rather than constants in
+    code (ADR-06), so an administrator can add one without a
+    redeployment.
+
+    Routing and SLA stay on the parent Category: a sub-category
+    refines what the complaint is about, not who handles it.
+    """
+
+    name = models.CharField(max_length=100)
+    code = models.SlugField(max_length=30)
+    category = models.ForeignKey(
+        Category,
+        on_delete=models.PROTECT,
+        related_name="sub_categories",
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["category__name", "name"]
+        verbose_name_plural = "sub-categories"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["category", "code"],
+                name="unique_subcategory_code_per_category",
+            ),
+            models.UniqueConstraint(
+                fields=["category", "name"],
+                name="unique_subcategory_name_per_category",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.category.name} / {self.name}"
+
+
 class ReferenceSequence(models.Model):
     """Per-year counter backing the SCMS-YYYY-NNNNNN reference ID."""
 
@@ -101,6 +141,25 @@ class Complaint(models.Model):
         on_delete=models.PROTECT,
         related_name="complaints",
     )
+
+    # SCMS-F-006 requires a sub-category and a location on the
+    # lodging form. Both are nullable/blank at the database level so
+    # that complaints recorded before this field existed remain
+    # valid; ComplaintForm makes them mandatory on the form, which
+    # is where the requirement applies.
+    sub_category = models.ForeignKey(
+        SubCategory,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="complaints",
+    )
+    location = models.CharField(
+        max_length=200,
+        blank=True,
+        help_text="Where the issue is, e.g. Block C, Room 302.",
+    )
+
     priority = models.CharField(
         max_length=10,
         choices=Priority.choices,
