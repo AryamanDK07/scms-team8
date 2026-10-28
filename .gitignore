@@ -3,3 +3,5 @@
 __pycache__/
 *.py[cod]
 *.sqlite3
+# Uploaded evidence (SCMS-F-008) is never committed.
+private-media/

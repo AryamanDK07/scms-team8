@@ -39,4 +39,14 @@ urlpatterns = [
         views.complaint_priority,
         name="complaint_priority",
     ),
+    path(
+        "<ref:reference_id>/attach/",
+        views.complaint_attachment_add,
+        name="complaint_attachment_add",
+    ),
+    path(
+        "<ref:reference_id>/attachments/<int:pk>/",
+        views.complaint_attachment_download,
+        name="complaint_attachment_download",
+    ),
 ]

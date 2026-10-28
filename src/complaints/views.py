@@ -1,16 +1,21 @@
 
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
+from django.core.exceptions import PermissionDenied
+from django.http import FileResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from .services import calculate_sla_deadline
 
+from .attachments import MAX_PER_COMPLAINT, canonical_content_type
 from .forms import (
     AssignComplaintForm,
+    AttachmentForm,
     ComplaintForm,
     PriorityOverrideForm,
 )
 from .models import (
     Complaint,
+    ComplaintAttachment,
     ComplaintStatusHistory,
 )
 from .permissions import require_complaint_access, role_required
@@ -127,6 +132,88 @@ def complaint_detail(request, reference_id):
             "complaint": complaint,
             "history": history,
         },
+    )
+
+
+@login_required
+def complaint_attachment_add(request, reference_id):
+    """Attach evidence to a complaint (SCMS-F-008).
+
+    Only the complainant who lodged it may add evidence; staff
+    record their own proof through the resolution flow.
+    """
+    complaint = get_object_or_404(Complaint, reference_id=reference_id)
+
+    require_complaint_access(complaint, request.user)
+
+    if complaint.submitted_by_id != request.user.id:
+        raise PermissionDenied(
+            "Only the complainant may attach evidence to this "
+            "complaint."
+        )
+
+    if request.method == "POST":
+        form = AttachmentForm(
+            request.POST, request.FILES, complaint=complaint,
+        )
+
+        if form.is_valid():
+            upload = form.cleaned_data["file"]
+
+            ComplaintAttachment.objects.create(
+                complaint=complaint,
+                file=upload,
+                original_name=upload.name[:255],
+                content_type=canonical_content_type(
+                    form.detected_format,
+                ),
+                size_bytes=upload.size,
+                uploaded_by=request.user,
+            )
+
+            messages.success(
+                request, f"\"{upload.name}\" attached.",
+            )
+
+            return redirect(
+                "complaints:complaint_detail",
+                reference_id=complaint.reference_id,
+            )
+    else:
+        form = AttachmentForm(complaint=complaint)
+
+    return render(
+        request,
+        "complaints/complaint_attachment_form.html",
+        {
+            "complaint": complaint,
+            "form": form,
+            "remaining": MAX_PER_COMPLAINT - complaint.attachments.count(),
+        },
+    )
+
+
+@login_required
+def complaint_attachment_download(request, reference_id, pk):
+    """Serve an attachment after checking access (SCMS-SR-005).
+
+    Files are not reachable by URL: they are stored outside the web
+    root and only handed over here, once the requester has been
+    shown to have access to the complaint.
+    """
+    complaint = get_object_or_404(Complaint, reference_id=reference_id)
+
+    require_complaint_access(complaint, request.user)
+
+    attachment = get_object_or_404(
+        complaint.attachments, pk=pk,
+    )
+
+    return FileResponse(
+        attachment.file.open("rb"),
+        as_attachment=True,
+        filename=attachment.original_name,
+        content_type=attachment.content_type,
     )
 
 
