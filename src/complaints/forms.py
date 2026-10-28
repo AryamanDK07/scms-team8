@@ -32,6 +32,54 @@ class EmailLoginForm(AuthenticationForm):
     }
 
 
+class PriorityOverrideForm(forms.Form):
+    """Override a complaint's matrix priority (SCMS-F-013).
+
+    The reason is always mandatory here. Unlike a first assignment,
+    there is no "first" override: every one of these departs from
+    the matrix and needs to say why.
+    """
+
+    priority = forms.ChoiceField(
+        choices=Complaint.Priority.choices,
+        label="New priority",
+    )
+    reason = forms.CharField(
+        widget=forms.Textarea(attrs={
+            "rows": 3,
+            "placeholder": "Why does this need a different priority?",
+        }),
+        help_text="Recorded in the audit trail with the old and new value.",
+    )
+
+    def __init__(self, *args, complaint=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.complaint = complaint
+
+    def clean_priority(self):
+        priority = self.cleaned_data["priority"]
+
+        if self.complaint is not None and priority == self.complaint.priority:
+            raise forms.ValidationError(
+                f"This complaint is already "
+                f"{self.complaint.get_priority_display()}. "
+                f"Choose a different priority."
+            )
+
+        return priority
+
+    def clean_reason(self):
+        reason = self.cleaned_data.get("reason", "")
+
+        if not reason.strip():
+            raise forms.ValidationError(
+                "Give a reason for departing from the category's "
+                "default priority."
+            )
+
+        return reason
+
+
 class AssignComplaintForm(forms.Form):
     """Assign or reassign a complaint to an agent (SCMS-F-012).
 
@@ -130,13 +178,16 @@ class ComplaintForm(forms.ModelForm):
 
     class Meta:
         model = Complaint
+        # Priority is deliberately absent. SCMS-F-013 takes it from
+        # the category's priority matrix, and only a Department Admin
+        # may override it. Letting a complainant choose their own
+        # priority would make the field meaningless for triage.
         fields = [
             "title",
             "category",
             "sub_category",
             "location",
             "description",
-            "priority",
         ]
 
         labels = {

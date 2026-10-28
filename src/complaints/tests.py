@@ -22,6 +22,8 @@ from .services import (
     calculate_sla_deadline,
     can_reopen,
     eligible_agents,
+    override_priority,
+    priority_for,
 )
 
 
@@ -908,6 +910,217 @@ class AssignmentTests(BaseFixture):
 
         entry = self.complaint.status_history.first()
         self.assertIsNotNone(entry.source_ip)
+
+
+class PriorityMatrixTests(BaseFixture):
+    """SCMS-F-013 / TC-Route-03: matrix default, logged override."""
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        # BaseFixture's category is High; add a Low one to prove the
+        # priority tracks the category rather than a constant.
+        self.low_category = Category.objects.create(
+            name="Stationery",
+            code="stationery",
+            department=self.department,
+            default_priority=Complaint.Priority.LOW,
+        )
+        self.sub_category = SubCategory.objects.create(
+            name="Projector", code="projector", category=self.category,
+        )
+        self.low_sub_category = SubCategory.objects.create(
+            name="Pens", code="pens", category=self.low_category,
+        )
+
+        profile = self.user.profile
+        profile.role = Role.COMPLAINANT
+        profile.save()
+
+        self.admin = self.make_staff(
+            "itadmin", Role.DEPARTMENT_ADMIN, self.department,
+        )
+        self.agent = self.make_staff(
+            "agent", Role.SUPPORT_AGENT, self.department,
+        )
+
+    def make_staff(self, username, role, department):
+        user = get_user_model().objects.create_user(
+            username=username, password="not-a-real-password",
+        )
+        profile = user.profile
+        profile.role = role
+        profile.department = department
+        profile.save()
+        return user
+
+    def lodge(self, category=None, sub_category=None, priority=None):
+        """Lodge a complaint, optionally trying to force a priority."""
+        self.client.force_login(self.user)
+        data = {
+            "title": "Projector not working",
+            "category": (category or self.category).pk,
+            "sub_category": (sub_category or self.sub_category).pk,
+            "location": "Block C, Room 302",
+            "description": "The projector in room 302 does not switch on.",
+        }
+        if priority is not None:
+            data["priority"] = priority
+
+        response = self.client.post("/new/", data)
+        self.assertEqual(response.status_code, 302)
+        self.client.logout()
+        return Complaint.objects.latest("created_at")
+
+    def url(self, complaint=None):
+        target = complaint or self.complaint_for_override()
+        return f"/{target.reference_id}/priority/"
+
+    def complaint_for_override(self):
+        if not hasattr(self, "_complaint"):
+            self._complaint = self.make_complaint(
+                assigned_department=self.department,
+                priority=Complaint.Priority.MEDIUM,
+            )
+        return self._complaint
+
+    # --- the matrix --------------------------------------------------
+
+    def test_priority_comes_from_the_category(self):
+        self.assertEqual(
+            self.lodge().priority, Complaint.Priority.HIGH,
+        )
+
+    def test_a_different_category_gives_a_different_priority(self):
+        complaint = self.lodge(
+            category=self.low_category,
+            sub_category=self.low_sub_category,
+        )
+        self.assertEqual(complaint.priority, Complaint.Priority.LOW)
+
+    def test_complainant_cannot_choose_their_own_priority(self):
+        """A self-declared priority would make triage meaningless."""
+        complaint = self.lodge(priority=Complaint.Priority.CRITICAL)
+        self.assertEqual(complaint.priority, Complaint.Priority.HIGH)
+
+    def test_priority_is_not_a_field_on_the_lodging_form(self):
+        self.client.force_login(self.user)
+        response = self.client.get("/new/")
+        self.assertNotIn("priority", response.context["form"].fields)
+
+    def test_changing_the_matrix_changes_later_complaints(self):
+        """ADR-06: triage is configuration, not code."""
+        self.assertEqual(self.lodge().priority, Complaint.Priority.HIGH)
+
+        self.category.default_priority = Complaint.Priority.CRITICAL
+        self.category.save()
+
+        self.assertEqual(self.lodge().priority, Complaint.Priority.CRITICAL)
+
+    def test_category_without_a_priority_falls_back_to_medium(self):
+        self.category.default_priority = ""
+        self.assertEqual(
+            priority_for(self.category), Complaint.Priority.MEDIUM,
+        )
+
+    # --- the override ------------------------------------------------
+
+    def test_override_records_old_and_new_values(self):
+        complaint = self.complaint_for_override()
+
+        override_priority(
+            complaint,
+            priority=Complaint.Priority.CRITICAL,
+            actor=self.admin,
+            reason="Affects an entire floor",
+        )
+
+        complaint.refresh_from_db()
+        self.assertEqual(complaint.priority, Complaint.Priority.CRITICAL)
+
+        entry = complaint.status_history.first()
+        self.assertIn("Medium", entry.comment)
+        self.assertIn("Critical", entry.comment)
+        self.assertIn("Affects an entire floor", entry.comment)
+        self.assertEqual(entry.changed_by, self.admin)
+
+    def test_override_without_a_reason_is_blocked(self):
+        complaint = self.complaint_for_override()
+
+        with self.assertRaises(ValueError):
+            override_priority(
+                complaint,
+                priority=Complaint.Priority.CRITICAL,
+                actor=self.admin,
+                reason="   ",
+            )
+
+        complaint.refresh_from_db()
+        self.assertEqual(complaint.priority, Complaint.Priority.MEDIUM)
+
+    def test_override_to_the_same_priority_is_refused(self):
+        complaint = self.complaint_for_override()
+
+        with self.assertRaises(ValueError):
+            override_priority(
+                complaint,
+                priority=Complaint.Priority.MEDIUM,
+                actor=self.admin,
+                reason="No change intended",
+            )
+
+    def test_override_does_not_change_the_status(self):
+        complaint = self.complaint_for_override()
+        before = complaint.status
+
+        override_priority(
+            complaint,
+            priority=Complaint.Priority.LOW,
+            actor=self.admin,
+            reason="Lower impact than first thought",
+        )
+
+        complaint.refresh_from_db()
+        self.assertEqual(complaint.status, before)
+
+    # --- the view ----------------------------------------------------
+
+    def test_admin_can_override_through_the_view(self):
+        complaint = self.complaint_for_override()
+        self.client.force_login(self.admin)
+
+        response = self.client.post(self.url(), {
+            "priority": Complaint.Priority.CRITICAL,
+            "reason": "Affects an entire floor",
+        })
+
+        self.assertEqual(response.status_code, 302)
+        complaint.refresh_from_db()
+        self.assertEqual(complaint.priority, Complaint.Priority.CRITICAL)
+
+    def test_view_blocks_an_override_with_no_reason(self):
+        complaint = self.complaint_for_override()
+        self.client.force_login(self.admin)
+
+        response = self.client.post(self.url(), {
+            "priority": Complaint.Priority.CRITICAL,
+            "reason": "",
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("reason", response.context["form"].errors)
+
+        complaint.refresh_from_db()
+        self.assertEqual(complaint.priority, Complaint.Priority.MEDIUM)
+
+    def test_agent_cannot_override_priority(self):
+        self.client.force_login(self.agent)
+        self.assertEqual(self.client.get(self.url()).status_code, 403)
+
+    def test_complainant_cannot_override_priority(self):
+        self.client.force_login(self.user)
+        self.assertEqual(self.client.get(self.url()).status_code, 403)
 
 
 class RoleFixture(BaseFixture):

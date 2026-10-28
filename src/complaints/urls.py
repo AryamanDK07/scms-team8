@@ -34,4 +34,9 @@ urlpatterns = [
         views.complaint_assign,
         name="complaint_assign",
     ),
+    path(
+        "<ref:reference_id>/priority/",
+        views.complaint_priority,
+        name="complaint_priority",
+    ),
 ]
