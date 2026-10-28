@@ -104,6 +104,64 @@
 </div>
 
 <div class="card">
+    <h2>Conversation</h2>
+
+    {# SCMS-F-017. Visible to the complainant and the assigned
+       agent, and to no other complainant. #}
+    {% for comment in thread %}
+        <div style="padding:12px 0; border-bottom:1px solid #e3e8ef">
+            <strong>{{ comment.author }}</strong>
+            <span class="muted">
+                {{ comment.created_at|date:"d M Y, H:i" }}
+            </span>
+            <p style="white-space: pre-wrap">{{ comment.body }}</p>
+
+            {% for reply in comment.replies.all %}
+                <div style="margin-left:28px; padding:8px 0;
+                            border-left:3px solid #e3e8ef;
+                            padding-left:12px">
+                    <strong>{{ reply.author }}</strong>
+                    <span class="muted">
+                        {{ reply.created_at|date:"d M Y, H:i" }}
+                    </span>
+                    <p style="white-space: pre-wrap">{{ reply.body }}</p>
+                </div>
+            {% endfor %}
+
+            <form method="post"
+                  action="{% url 'complaints:complaint_comment_add' complaint.reference_id %}">
+                {% csrf_token %}
+                <input type="hidden" name="parent" value="{{ comment.pk }}">
+                <input type="text" name="body" placeholder="Reply">
+                <button type="submit" class="button">Reply</button>
+            </form>
+        </div>
+    {% empty %}
+        <p>No comments yet.</p>
+    {% endfor %}
+
+    <h3>Add a comment</h3>
+
+    <form method="post"
+          action="{% url 'complaints:complaint_comment_add' complaint.reference_id %}">
+        {% csrf_token %}
+
+        {% for error in comment_form.non_field_errors %}
+            <p class="errorlist">{{ error }}</p>
+        {% endfor %}
+
+        <p>
+            {{ comment_form.body }}
+            {% for error in comment_form.body.errors %}
+                <span class="errorlist">{{ error }}</span>
+            {% endfor %}
+        </p>
+
+        <button type="submit" class="button">Post comment</button>
+    </form>
+</div>
+
+<div class="card">
     <h2>Status History</h2>
 
     {# SCMS-F-016: a dated history of transitions, newest first. #}
