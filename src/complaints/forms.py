@@ -2,6 +2,7 @@ from django import forms
 from django.contrib.auth import get_user_model
 from django.contrib.auth.forms import AuthenticationForm
 
+from .attachments import AttachmentRejected, validate_upload
 from .models import Category, Complaint, SubCategory
 from .services import eligible_agents
 
@@ -78,6 +79,39 @@ class PriorityOverrideForm(forms.Form):
             )
 
         return reason
+
+
+class AttachmentForm(forms.Form):
+    """Upload one piece of evidence (SCMS-F-008)."""
+
+    file = forms.FileField(
+        label="Evidence file",
+        help_text=(
+            "JPG, PNG or PDF, up to 5 MB. Three attachments maximum."
+        ),
+    )
+
+    def __init__(self, *args, complaint=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.complaint = complaint
+
+    def clean_file(self):
+        upload = self.cleaned_data["file"]
+
+        existing = (
+            self.complaint.attachments.count()
+            if self.complaint is not None
+            else 0
+        )
+
+        try:
+            self.detected_format = validate_upload(upload, existing)
+        except AttachmentRejected as rejection:
+            # The message names the rule that was broken, which is
+            # what the acceptance criterion asks for.
+            raise forms.ValidationError(str(rejection))
+
+        return upload
 
 
 class AssignComplaintForm(forms.Form):

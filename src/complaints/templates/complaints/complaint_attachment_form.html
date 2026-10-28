@@ -1,0 +1,59 @@
+
+{% extends "complaints/base.html" %}
+
+{% block title %}Attach Evidence | SCMS{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h1>Attach evidence</h1>
+
+    <p class="muted">
+        {{ complaint.reference_id }} &mdash; {{ complaint.title }}
+    </p>
+
+    {% if remaining > 0 %}
+        <p>
+            You may attach
+            {{ remaining }} more
+            {% if remaining == 1 %}file{% else %}files{% endif %}
+            to this complaint.
+        </p>
+
+        <form method="post" enctype="multipart/form-data">
+            {% csrf_token %}
+
+            {% for error in form.non_field_errors %}
+                <p class="errorlist">{{ error }}</p>
+            {% endfor %}
+
+            {% for field in form %}
+                <p>
+                    {{ field.label_tag }}
+                    {{ field }}
+
+                    {% if field.help_text %}
+                        <span class="muted">{{ field.help_text }}</span>
+                    {% endif %}
+
+                    {% for error in field.errors %}
+                        <span class="errorlist">{{ error }}</span>
+                    {% endfor %}
+                </p>
+            {% endfor %}
+
+            <button type="submit" class="button">Attach</button>
+        </form>
+    {% else %}
+        <p class="errorlist">
+            This complaint already has the maximum of three
+            attachments.
+        </p>
+    {% endif %}
+
+    <p class="muted">
+        <a href="{% url 'complaints:complaint_detail' complaint.reference_id %}">
+            Back to complaint
+        </a>
+    </p>
+</div>
+{% endblock %}

@@ -1,4 +1,7 @@
 
+from pathlib import Path
+from uuid import uuid4
+
 from django.conf import settings
 from django.db import models
 from django.db.models.signals import post_save
@@ -289,6 +292,62 @@ class ComplaintStatusHistory(models.Model):
             "Audit rows are append-only and cannot be deleted "
             "(SCMS-SR-006)."
         )
+
+
+def attachment_path(instance, filename):
+    """Store under a random name, keyed by complaint reference.
+
+    The name a complainant uploaded is kept in original_name for
+    display; the file on disk gets a random one so that the stored
+    path reveals nothing and two uploads of "photo.jpg" cannot
+    collide.
+    """
+    suffix = Path(filename).suffix.lower()
+
+    return (
+        f"complaints/{instance.complaint.reference_id}/"
+        f"{uuid4().hex}{suffix}"
+    )
+
+
+class ComplaintAttachment(models.Model):
+    """Evidence supporting a complaint (SCMS-F-008).
+
+    Files live under MEDIA_ROOT, which is outside the web root and
+    not served directly; they are read back through a view that
+    checks access first, so one complainant cannot fetch another's
+    evidence by guessing a URL.
+    """
+
+    complaint = models.ForeignKey(
+        Complaint,
+        on_delete=models.PROTECT,
+        related_name="attachments",
+    )
+    file = models.FileField(upload_to=attachment_path)
+    original_name = models.CharField(
+        max_length=255,
+        help_text="The filename as uploaded, for display.",
+    )
+    content_type = models.CharField(
+        max_length=100,
+        help_text="Determined by reading the file, not from the client.",
+    )
+    size_bytes = models.PositiveIntegerField()
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="complaint_attachments",
+    )
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["uploaded_at"]
+
+    def __str__(self):
+        return f"{self.complaint.reference_id}: {self.original_name}"
 
 
 class UserProfile(models.Model):

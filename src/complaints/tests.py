@@ -1,4 +1,6 @@
 import re
+import shutil
+import tempfile
 from datetime import datetime, timedelta
 from unittest.mock import patch
 
@@ -7,12 +9,15 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
 from django.contrib.sessions.models import Session
 from django.core import mail
-from django.test import TestCase
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import TestCase, override_settings
 from django.utils import timezone
 
+from .attachments import MAX_BYTES
 from .models import (
     Category,
     Complaint,
+    ComplaintAttachment,
     ComplaintStatusHistory,
     Department,
     SubCategory,
@@ -1121,6 +1126,208 @@ class PriorityMatrixTests(BaseFixture):
     def test_complainant_cannot_override_priority(self):
         self.client.force_login(self.user)
         self.assertEqual(self.client.get(self.url()).status_code, 403)
+
+
+class AttachmentTests(BaseFixture):
+    """SCMS-F-008 / TC-Lodge-03: three files, three formats, 5 MB."""
+
+    JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
+    PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    PDF = b"%PDF-1.7\n" + b"\x00" * 64
+    EXE = b"MZ\x90\x00" + b"\x00" * 64
+
+    @classmethod
+    def setUpClass(cls):
+        """Send uploads to a temp directory, not into the repo tree."""
+        super().setUpClass()
+        cls._media_root = tempfile.mkdtemp()
+        cls._media_override = override_settings(
+            MEDIA_ROOT=cls._media_root,
+        )
+        cls._media_override.enable()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._media_override.disable()
+        shutil.rmtree(cls._media_root, ignore_errors=True)
+        super().tearDownClass()
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        profile = self.user.profile
+        profile.role = Role.COMPLAINANT
+        profile.save()
+
+        self.other = get_user_model().objects.create_user(
+            username="other", password="not-a-real-password",
+        )
+
+        self.complaint = self.make_complaint(
+            assigned_department=self.department,
+        )
+        self.client.force_login(self.user)
+
+    def url(self):
+        return f"/{self.complaint.reference_id}/attach/"
+
+    def upload(self, name, content, content_type="image/jpeg"):
+        return self.client.post(self.url(), {
+            "file": SimpleUploadedFile(name, content, content_type),
+        })
+
+    def attach_directly(self, name="evidence.jpg", content=None):
+        """Create an attachment without going through the view."""
+        upload = SimpleUploadedFile(
+            name, content or self.JPEG, "image/jpeg",
+        )
+        return ComplaintAttachment.objects.create(
+            complaint=self.complaint,
+            file=upload,
+            original_name=name,
+            content_type="image/jpeg",
+            size_bytes=upload.size,
+            uploaded_by=self.user,
+        )
+
+    def form_errors(self, response):
+        return str(response.context["form"].errors)
+
+    # --- the three permitted formats ---------------------------------
+
+    def test_jpg_is_accepted(self):
+        response = self.upload("evidence.jpg", self.JPEG)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.complaint.attachments.count(), 1)
+
+    def test_png_is_accepted(self):
+        response = self.upload("evidence.png", self.PNG, "image/png")
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.complaint.attachments.count(), 1)
+
+    def test_pdf_is_accepted(self):
+        response = self.upload(
+            "evidence.pdf", self.PDF, "application/pdf",
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.complaint.attachments.count(), 1)
+
+    def test_content_type_is_taken_from_the_file_not_the_client(self):
+        """A lying Content-Type must not reach the database."""
+        self.upload("evidence.png", self.PNG, "application/x-evil")
+        self.assertEqual(
+            self.complaint.attachments.get().content_type, "image/png",
+        )
+
+    # --- the three rejections the criterion names --------------------
+
+    def test_a_fourth_file_is_rejected(self):
+        for index in range(3):
+            self.attach_directly(f"evidence{index}.jpg")
+
+        response = self.upload("fourth.jpg", self.JPEG)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.complaint.attachments.count(), 3)
+        self.assertIn("at most 3", self.form_errors(response))
+
+    def test_a_file_over_five_megabytes_is_rejected(self):
+        oversized = self.JPEG + b"\x00" * (5 * 1024 * 1024)
+
+        response = self.upload("huge.jpg", oversized)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(self.complaint.attachments.exists())
+        self.assertIn("5 MB", self.form_errors(response))
+
+    def test_an_executable_is_rejected(self):
+        response = self.upload(
+            "payload.exe", self.EXE, "application/octet-stream",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(self.complaint.attachments.exists())
+        self.assertIn("not a JPG, PNG or PDF", self.form_errors(response))
+
+    def test_an_executable_renamed_to_jpg_is_still_rejected(self):
+        """The case an extension check alone would let through."""
+        response = self.upload("payload.jpg", self.EXE)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(self.complaint.attachments.exists())
+        self.assertIn("not a JPG, PNG or PDF", self.form_errors(response))
+
+    def test_a_png_with_a_jpg_extension_is_rejected(self):
+        """Real image, mismatched extension: say so rather than guess."""
+        response = self.upload("evidence.jpg", self.PNG)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("extension", self.form_errors(response))
+
+    def test_an_empty_file_is_rejected(self):
+        response = self.upload("empty.jpg", b"")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(self.complaint.attachments.exists())
+
+    # --- boundaries --------------------------------------------------
+
+    def test_a_file_at_exactly_five_megabytes_is_accepted(self):
+        exact = self.JPEG + b"\x00" * (MAX_BYTES - len(self.JPEG))
+        self.assertEqual(len(exact), MAX_BYTES)
+
+        response = self.upload("exact.jpg", exact)
+        self.assertEqual(response.status_code, 302)
+
+    def test_three_files_are_accepted(self):
+        for index in range(3):
+            response = self.upload(f"evidence{index}.jpg", self.JPEG)
+            self.assertEqual(response.status_code, 302)
+
+        self.assertEqual(self.complaint.attachments.count(), 3)
+
+    # --- storage and access ------------------------------------------
+
+    def test_stored_path_does_not_reuse_the_uploaded_name(self):
+        self.upload("my-holiday-photo.jpg", self.JPEG)
+        attachment = self.complaint.attachments.get()
+
+        self.assertNotIn("my-holiday-photo", attachment.file.name)
+        self.assertEqual(attachment.original_name, "my-holiday-photo.jpg")
+
+    def test_two_files_of_the_same_name_do_not_collide(self):
+        self.upload("photo.jpg", self.JPEG)
+        self.upload("photo.jpg", self.JPEG)
+
+        paths = {a.file.name for a in self.complaint.attachments.all()}
+        self.assertEqual(len(paths), 2)
+
+    def test_owner_can_download_their_evidence(self):
+        self.upload("evidence.jpg", self.JPEG)
+        attachment = self.complaint.attachments.get()
+
+        response = self.client.get(
+            f"/{self.complaint.reference_id}/attachments/"
+            f"{attachment.pk}/"
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_another_complainant_cannot_download_it(self):
+        """SCMS-SR-005: evidence is not reachable by guessing a URL."""
+        self.upload("evidence.jpg", self.JPEG)
+        attachment = self.complaint.attachments.get()
+
+        self.client.force_login(self.other)
+        response = self.client.get(
+            f"/{self.complaint.reference_id}/attachments/"
+            f"{attachment.pk}/"
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_another_complainant_cannot_attach_to_this_complaint(self):
+        self.client.force_login(self.other)
+        response = self.upload("evidence.jpg", self.JPEG)
+        self.assertEqual(response.status_code, 403)
 
 
 class RoleFixture(BaseFixture):

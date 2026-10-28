@@ -126,6 +126,12 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
+# Uploaded evidence (SCMS-F-008, SCMS-SR-005)
+# MEDIA_ROOT sits outside the web root and no MEDIA_URL is served,
+# so an attachment cannot be fetched by URL. Files are read back
+# through complaint_attachment_download, which checks access first.
+MEDIA_ROOT = BASE_DIR.parent / "private-media"
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 

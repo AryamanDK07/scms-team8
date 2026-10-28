@@ -59,6 +59,39 @@
 </div>
 
 <div class="card">
+    <h2>Evidence</h2>
+
+    {# SCMS-F-008. Links go through an access-checked view, not
+       straight at the stored file. #}
+    {% if complaint.attachments.all %}
+        <ul>
+            {% for attachment in complaint.attachments.all %}
+                <li>
+                    <a href="{% url 'complaints:complaint_attachment_download' complaint.reference_id attachment.pk %}">
+                        {{ attachment.original_name }}
+                    </a>
+                    <span class="muted">
+                        {{ attachment.size_bytes|filesizeformat }},
+                        uploaded {{ attachment.uploaded_at|date:"d M Y, H:i" }}
+                    </span>
+                </li>
+            {% endfor %}
+        </ul>
+    {% else %}
+        <p>No evidence attached.</p>
+    {% endif %}
+
+    {% if complaint.submitted_by_id == request.user.id %}
+        <p>
+            <a href="{% url 'complaints:complaint_attachment_add' complaint.reference_id %}"
+               class="button">
+                Attach evidence
+            </a>
+        </p>
+    {% endif %}
+</div>
+
+<div class="card">
     <h2>Status History</h2>
 
     {% if history %}
