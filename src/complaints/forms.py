@@ -321,7 +321,12 @@ class ComplaintForm(forms.ModelForm):
         empty_label="Select a category",
     )
     sub_category = forms.ModelChoiceField(
-        queryset=SubCategory.objects.filter(is_active=True),
+        # Also excludes sub-categories whose parent category has
+        # been deactivated: offering one would list a choice that
+        # cannot pair with any selectable category (SCMS-F-023).
+        queryset=SubCategory.objects.filter(
+            is_active=True, category__is_active=True,
+        ),
         empty_label="Select a sub-category",
         required=True,
         label="Sub-category",
