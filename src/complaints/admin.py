@@ -1,5 +1,7 @@
 
 from django.contrib import admin
+from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
+from django.contrib.auth.models import User
 from django.utils import timezone
 
 from .models import (
@@ -8,6 +10,7 @@ from .models import (
     Category,
     ComplaintStatusHistory,
     SubCategory,
+    UserProfile,
 )
 from .services import calculate_sla_deadline
 
@@ -220,3 +223,59 @@ class SubCategoryAdmin(admin.ModelAdmin):
     list_filter = ("category", "is_active")
     search_fields = ("name", "code", "category__name")
     ordering = ("category__name", "name")
+
+
+class UserProfileInline(admin.StackedInline):
+    """Role and department, shown on the user's own admin page.
+
+    SCMS-F-003 gives every user a role, but until now nothing
+    exposed it: a profile was created by signal and could only be
+    changed from a shell. That left the application unusable as
+    anything but a Complainant.
+
+    An inline keeps role and account together, so granting someone
+    the Support Agent role is one edit rather than two objects to
+    find and match up.
+    """
+
+    model = UserProfile
+    can_delete = False
+    verbose_name_plural = "SCMS role"
+    fields = ("role", "department")
+
+
+class UserAdmin(BaseUserAdmin):
+    inlines = (UserProfileInline,)
+    list_display = BaseUserAdmin.list_display + ("scms_role", "department")
+    list_filter = BaseUserAdmin.list_filter + ("profile__role",)
+
+    def get_queryset(self, request):
+        return super().get_queryset(request).select_related(
+            "profile__department",
+        )
+
+    @admin.display(description="SCMS role", ordering="profile__role")
+    def scms_role(self, obj):
+        profile = getattr(obj, "profile", None)
+
+        return profile.get_role_display() if profile else "-"
+
+    @admin.display(description="Department", ordering="profile__department")
+    def department(self, obj):
+        profile = getattr(obj, "profile", None)
+
+        return profile.department if profile and profile.department else "-"
+
+
+admin.site.unregister(User)
+admin.site.register(User, UserAdmin)
+
+
+@admin.register(UserProfile)
+class UserProfileAdmin(admin.ModelAdmin):
+    """The roles on their own, for reviewing who holds what."""
+
+    list_display = ("user", "role", "department", "created_at")
+    list_filter = ("role", "department")
+    search_fields = ("user__username", "user__email")
+    ordering = ("user__username",)

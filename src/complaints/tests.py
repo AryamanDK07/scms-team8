@@ -1765,6 +1765,80 @@ class CommentTests(BaseFixture):
         )
 
 
+class RoleAdminTests(BaseFixture):
+    """Roles must be administrable, not shell-only (SCMS-F-003)."""
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.Role = Role
+        self.superuser = get_user_model().objects.create_superuser(
+            username="root",
+            email="root@example.com",
+            password="not-a-real-password",
+        )
+        self.client.force_login(self.superuser)
+
+    def test_user_admin_page_loads(self):
+        response = self.client.get(
+            f"/admin/auth/user/{self.user.pk}/change/",
+        )
+        self.assertEqual(response.status_code, 200)
+
+    def test_user_admin_offers_the_role_inline(self):
+        response = self.client.get(
+            f"/admin/auth/user/{self.user.pk}/change/",
+        )
+        self.assertContains(response, "profile-0-role")
+
+    def test_role_can_be_changed_through_the_admin(self):
+        """The gap this closes: previously only a shell could do it."""
+        response = self.client.post(
+            f"/admin/auth/user/{self.user.pk}/change/",
+            {
+                "username": self.user.username,
+                "email": self.user.email,
+                "first_name": "",
+                "last_name": "",
+                "is_active": "on",
+                "date_joined_0": "2026-01-01",
+                "date_joined_1": "00:00:00",
+                "profile-TOTAL_FORMS": "1",
+                "profile-INITIAL_FORMS": "1",
+                "profile-MIN_NUM_FORMS": "0",
+                "profile-MAX_NUM_FORMS": "1",
+                "profile-0-id": str(self.user.profile.pk),
+                "profile-0-user": str(self.user.pk),
+                "profile-0-role": self.Role.SUPPORT_AGENT,
+                "profile-0-department": str(self.department.pk),
+                "_save": "Save",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+
+        self.user.profile.refresh_from_db()
+        self.assertEqual(
+            self.user.profile.role, self.Role.SUPPORT_AGENT,
+        )
+        self.assertEqual(
+            self.user.profile.department, self.department,
+        )
+
+    def test_profiles_are_listed_on_their_own(self):
+        response = self.client.get("/admin/complaints/userprofile/")
+        self.assertEqual(response.status_code, 200)
+
+    def test_user_list_shows_the_scms_role(self):
+        profile = self.user.profile
+        profile.role = self.Role.DEPARTMENT_ADMIN
+        profile.save()
+
+        response = self.client.get("/admin/auth/user/")
+        self.assertContains(response, "Department Admin")
+
+
 class RoleFixture(BaseFixture):
     """Users across the four roles for authorisation tests."""
 
