@@ -1,4 +1,5 @@
 
+from django import forms
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
 from django.contrib.auth.models import User
@@ -15,8 +16,48 @@ from .models import (
 from .services import calculate_sla_deadline
 
 
+class DepartmentAdminForm(forms.ModelForm):
+    """Guards deactivation of a department (SCMS-F-023).
+
+    Routing reads the department off the category. Deactivating a
+    department that categories still point at does not fail
+    loudly: complaints in those categories are lodged with no
+    department at all, and no queue shows an unassigned complaint,
+    so they simply stop being seen.
+    """
+
+    class Meta:
+        model = Department
+        fields = "__all__"
+
+    def clean_is_active(self):
+        is_active = self.cleaned_data["is_active"]
+
+        if is_active or not self.instance.pk:
+            return is_active
+
+        routed = list(
+            self.instance.categories.filter(is_active=True)[:6]
+        )
+
+        if routed:
+            names = ", ".join(c.name for c in routed[:5])
+            more = " and others" if len(routed) > 5 else ""
+
+            raise forms.ValidationError(
+                f"{self.instance.name} is still the department for "
+                f"{names}{more}. Repoint those categories to another "
+                f"department, or deactivate them first. Otherwise new "
+                f"complaints in them would be lodged with no "
+                f"department and would not appear in any queue."
+            )
+
+        return is_active
+
+
 @admin.register(Department)
 class DepartmentAdmin(admin.ModelAdmin):
+    form = DepartmentAdminForm
     list_display = (
         "name",
         "code",

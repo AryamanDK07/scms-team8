@@ -2038,6 +2038,172 @@ class ResolutionTests(BaseFixture):
         self.assertEqual(self.client.get(self.url()).status_code, 403)
 
 
+class MasterDataTests(BaseFixture):
+    """SCMS-F-023 / TC-Admin-01: configuration, not code.
+
+    Each case changes a master-data row and shows the next complaint
+    behaving differently, with no restart and nothing redeployed.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.sub_category = SubCategory.objects.create(
+            name="Projector", code="projector", category=self.category,
+        )
+
+        profile = self.user.profile
+        profile.role = Role.COMPLAINANT
+        profile.save()
+
+        self.superuser = get_user_model().objects.create_superuser(
+            username="root",
+            email="root@example.com",
+            password="not-a-real-password",
+        )
+
+    def lodging_form(self):
+        self.client.force_login(self.user)
+        return self.client.get("/new/").context["form"]
+
+    def lodge(self, category=None, sub_category=None):
+        self.client.force_login(self.user)
+        response = self.client.post("/new/", {
+            "title": "Projector not working",
+            "category": (category or self.category).pk,
+            "sub_category": (sub_category or self.sub_category).pk,
+            "location": "Block C, Room 302",
+            "description": "The projector in room 302 does not switch on.",
+        })
+        self.assertEqual(response.status_code, 302)
+        return Complaint.objects.latest("created_at")
+
+    # --- categories ---------------------------------------------------
+
+    def test_a_new_category_is_immediately_selectable(self):
+        fresh = Category.objects.create(
+            name="Hostel", code="hostel", department=self.department,
+        )
+        self.assertIn(
+            fresh, self.lodging_form().fields["category"].queryset,
+        )
+
+    def test_a_deactivated_category_disappears_from_the_form(self):
+        self.category.is_active = False
+        self.category.save()
+
+        self.assertNotIn(
+            self.category,
+            self.lodging_form().fields["category"].queryset,
+        )
+
+    def test_deactivating_a_category_leaves_existing_complaints_alone(self):
+        lodged = self.lodge()
+
+        self.category.is_active = False
+        self.category.save()
+
+        lodged.refresh_from_db()
+        self.assertEqual(lodged.category, self.category)
+
+    # --- sub-categories -------------------------------------------------
+
+    def test_a_deactivated_sub_category_disappears(self):
+        self.sub_category.is_active = False
+        self.sub_category.save()
+
+        self.assertNotIn(
+            self.sub_category,
+            self.lodging_form().fields["sub_category"].queryset,
+        )
+
+    def test_sub_category_of_a_dead_category_disappears(self):
+        """Otherwise it lists a choice no category can pair with."""
+        self.category.is_active = False
+        self.category.save()
+
+        self.assertNotIn(
+            self.sub_category,
+            self.lodging_form().fields["sub_category"].queryset,
+        )
+
+    # --- SLA and the priority matrix -------------------------------------
+
+    def test_changing_the_sla_changes_the_next_deadline(self):
+        self.category.sla_hours = 4
+        self.category.save()
+
+        complaint = self.lodge()
+        gap = complaint.sla_due_at - complaint.created_at
+
+        self.assertAlmostEqual(gap.total_seconds(), 4 * 3600, delta=10)
+
+    def test_changing_the_matrix_changes_the_next_priority(self):
+        self.category.default_priority = Complaint.Priority.CRITICAL
+        self.category.save()
+
+        self.assertEqual(
+            self.lodge().priority, Complaint.Priority.CRITICAL,
+        )
+
+    # --- department deactivation -----------------------------------------
+
+    def admin_post_department(self, department, is_active):
+        self.client.force_login(self.superuser)
+        return self.client.post(
+            f"/admin/complaints/department/{department.pk}/change/",
+            {
+                "name": department.name,
+                "code": department.code,
+                "description": department.description,
+                **({"is_active": "on"} if is_active else {}),
+                "_save": "Save",
+            },
+        )
+
+    def test_department_in_use_cannot_be_deactivated(self):
+        """The silent failure this prevents: complaints with no queue."""
+        response = self.admin_post_department(self.department, False)
+
+        self.assertEqual(response.status_code, 200)
+        self.department.refresh_from_db()
+        self.assertTrue(self.department.is_active)
+
+    def test_the_refusal_names_the_blocking_category(self):
+        response = self.admin_post_department(self.department, False)
+        self.assertContains(response, self.category.name)
+
+    def test_department_can_be_deactivated_once_nothing_routes_to_it(self):
+        self.category.is_active = False
+        self.category.save()
+
+        response = self.admin_post_department(self.department, False)
+
+        self.assertEqual(response.status_code, 302)
+        self.department.refresh_from_db()
+        self.assertFalse(self.department.is_active)
+
+    def test_an_unused_department_can_be_deactivated(self):
+        spare = Department.objects.create(name="Spare", code="spare")
+
+        self.admin_post_department(spare, False)
+
+        spare.refresh_from_db()
+        self.assertFalse(spare.is_active)
+
+    # --- the admin screens exist -----------------------------------------
+
+    def test_master_data_screens_are_reachable(self):
+        self.client.force_login(self.superuser)
+
+        for model in ("department", "category", "subcategory"):
+            response = self.client.get(f"/admin/complaints/{model}/")
+            self.assertEqual(
+                response.status_code, 200, f"{model} list did not load",
+            )
+
+
 class RoleFixture(BaseFixture):
     """Users across the four roles for authorisation tests."""
 
