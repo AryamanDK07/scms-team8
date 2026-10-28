@@ -107,6 +107,119 @@ def override_priority(
     return complaint
 
 
+#: The legal status transitions (SCMS-F-016).
+#:
+#: Closed is terminal. Resolved can only go on to Closed or
+#: Reopened, which is what gives the 7-day reopen window in
+#: SCMS-F-019 something to apply to.
+STATUS_TRANSITIONS = {
+    Complaint.Status.OPEN: (
+        Complaint.Status.ASSIGNED,
+    ),
+    Complaint.Status.ASSIGNED: (
+        Complaint.Status.IN_PROGRESS,
+    ),
+    Complaint.Status.IN_PROGRESS: (
+        Complaint.Status.PENDING_INFORMATION,
+        Complaint.Status.RESOLVED,
+    ),
+    Complaint.Status.PENDING_INFORMATION: (
+        Complaint.Status.IN_PROGRESS,
+    ),
+    Complaint.Status.RESOLVED: (
+        Complaint.Status.CLOSED,
+        Complaint.Status.REOPENED,
+    ),
+    Complaint.Status.REOPENED: (
+        Complaint.Status.IN_PROGRESS,
+    ),
+    Complaint.Status.CLOSED: (),
+}
+
+#: Statuses that another requirement owns the entry conditions for.
+#:
+#: Resolved needs remarks and proof (SCMS-F-018) and Closed follows
+#: from it, so neither may be reached through the generic
+#: transition. Letting them through here would be a way to mark a
+#: complaint resolved with no evidence at all.
+GUARDED_STATUSES = (
+    Complaint.Status.RESOLVED,
+    Complaint.Status.CLOSED,
+)
+
+
+def allowed_transitions(complaint):
+    """Statuses this complaint may move to next (SCMS-F-016)."""
+    return STATUS_TRANSITIONS.get(complaint.status, ())
+
+
+def offerable_transitions(complaint):
+    """Transitions the generic status change may offer.
+
+    The guarded statuses are excluded: they have their own flows
+    with their own preconditions.
+    """
+    return tuple(
+        status
+        for status in allowed_transitions(complaint)
+        if status not in GUARDED_STATUSES
+    )
+
+
+def transition_status(
+    complaint, new_status, actor, comment="", source_ip=None,
+):
+    """Move a complaint to a new status, recording the transition.
+
+    SCMS-F-016. An illegal move raises ValueError rather than being
+    silently written, so the status column cannot drift out of the
+    state machine the SRS describes.
+    """
+    if new_status == complaint.status:
+        raise ValueError(
+            f"The complaint is already "
+            f"{complaint.get_status_display()}."
+        )
+
+    if new_status in GUARDED_STATUSES:
+        raise ValueError(
+            f"{new_status} has its own flow with preconditions and "
+            f"cannot be set through a generic status change."
+        )
+
+    if new_status not in allowed_transitions(complaint):
+        labels = dict(Complaint.Status.choices)
+        raise ValueError(
+            f"{complaint.get_status_display()} cannot move to "
+            f"{labels.get(new_status, new_status)}."
+        )
+
+    old_status = complaint.status
+    labels = dict(Complaint.Status.choices)
+
+    detail = (
+        f"Status changed from {labels.get(old_status, old_status)} "
+        f"to {labels.get(new_status, new_status)}."
+    )
+    if comment.strip():
+        detail = f"{detail} {comment.strip()}"
+
+    with transaction.atomic():
+        complaint.status = new_status
+        complaint.save(update_fields=["status", "updated_at"])
+
+        ComplaintStatusHistory.objects.create(
+            complaint=complaint,
+            old_status=old_status,
+            new_status=new_status,
+            changed_by=actor,
+            source_ip=source_ip,
+            comment=detail,
+        )
+
+    return complaint
+
+
 def eligible_agents(complaint):
     """Support Agents who may be given this complaint (SCMS-F-012).
 

@@ -22,8 +22,20 @@
     </p>
 
     <p>
+        {# category is a ForeignKey, so there is no
+           get_category_display: that rendered blank. #}
         <strong>Category:</strong>
-        {{ complaint.get_category_display }}
+        {{ complaint.category.name }}
+    </p>
+
+    <p>
+        <strong>Sub-category:</strong>
+        {{ complaint.sub_category.name|default:"Not recorded" }}
+    </p>
+
+    <p>
+        <strong>Location:</strong>
+        {{ complaint.location|default:"Not recorded" }}
     </p>
 
     <p>
@@ -94,13 +106,27 @@
 <div class="card">
     <h2>Status History</h2>
 
+    {# SCMS-F-016: a dated history of transitions, newest first. #}
     {% if history %}
         {% for event in history %}
             <div style="padding:12px 0; border-bottom:1px solid #e3e8ef">
-                <strong>{{ event.get_new_status_display }}</strong>
+                <strong>
+                    {% if event.old_status and event.old_status != event.new_status %}
+                        {{ event.get_old_status_display }}
+                        &rarr;
+                        {{ event.get_new_status_display }}
+                    {% else %}
+                        {{ event.get_new_status_display }}
+                    {% endif %}
+                </strong>
+
                 <p class="muted">
                     {{ event.created_at|date:"d M Y, H:i" }}
+                    {% if event.changed_by %}
+                        &middot; {{ event.changed_by }}
+                    {% endif %}
                 </p>
+
                 {% if event.comment %}
                     <p>{{ event.comment }}</p>
                 {% endif %}

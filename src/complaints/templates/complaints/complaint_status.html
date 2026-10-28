@@ -1,0 +1,55 @@
+
+{% extends "complaints/base.html" %}
+
+{% block title %}Status: {{ complaint.reference_id }} | SCMS{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h1>Change status of {{ complaint.reference_id }}</h1>
+
+    <p class="muted">{{ complaint.title }}</p>
+
+    <p>
+        Currently <strong>{{ complaint.get_status_display }}</strong>.
+    </p>
+
+    {% if has_moves %}
+        <form method="post">
+            {% csrf_token %}
+
+            {% for error in form.non_field_errors %}
+                <p class="errorlist">{{ error }}</p>
+            {% endfor %}
+
+            {% for field in form %}
+                <p>
+                    {{ field.label_tag }}
+                    {{ field }}
+
+                    {% if field.help_text %}
+                        <span class="muted">{{ field.help_text }}</span>
+                    {% endif %}
+
+                    {% for error in field.errors %}
+                        <span class="errorlist">{{ error }}</span>
+                    {% endfor %}
+                </p>
+            {% endfor %}
+
+            <button type="submit" class="button">Change status</button>
+        </form>
+    {% else %}
+        <p class="errorlist">
+            There is no status change available from here through this
+            page. Resolving a complaint needs resolution remarks and
+            proof, and goes through the resolution flow instead.
+        </p>
+    {% endif %}
+
+    <p class="muted">
+        <a href="{% url 'complaints:complaint_detail' complaint.reference_id %}">
+            Back to complaint
+        </a>
+    </p>
+</div>
+{% endblock %}

@@ -12,6 +12,7 @@ from .forms import (
     AttachmentForm,
     ComplaintForm,
     PriorityOverrideForm,
+    StatusChangeForm,
 )
 from .models import (
     Complaint,
@@ -20,7 +21,13 @@ from .models import (
 )
 from .permissions import require_complaint_access, role_required
 from .roles import Role, STAFF_ROLES, get_department, get_role
-from .services import assign_complaint, override_priority, priority_for
+from .services import (
+    assign_complaint,
+    offerable_transitions,
+    override_priority,
+    priority_for,
+    transition_status,
+)
 
 
 @login_required
@@ -308,6 +315,59 @@ def complaint_priority(request, reference_id):
         request,
         "complaints/complaint_priority.html",
         {"complaint": complaint, "form": form},
+    )
+
+
+@role_required(*STAFF_ROLES)
+def complaint_status(request, reference_id):
+    """Move a complaint along the state machine (SCMS-F-016)."""
+    complaint = get_object_or_404(
+        Complaint.objects.select_related(
+            "assigned_department", "assigned_to", "category",
+        ),
+        reference_id=reference_id,
+    )
+
+    require_complaint_access(complaint, request.user, write=True)
+
+    if request.method == "POST":
+        form = StatusChangeForm(request.POST, complaint=complaint)
+
+        if form.is_valid():
+            try:
+                transition_status(
+                    complaint,
+                    new_status=form.cleaned_data["status"],
+                    actor=request.user,
+                    comment=form.cleaned_data["comment"],
+                    source_ip=request.META.get("REMOTE_ADDR"),
+                )
+            except ValueError as error:
+                # The form only offers legal moves, so this is the
+                # race where someone else moved the complaint first.
+                form.add_error(None, str(error))
+            else:
+                messages.success(
+                    request,
+                    f"{complaint.reference_id} is now "
+                    f"{complaint.get_status_display()}.",
+                )
+
+                return redirect(
+                    "complaints:complaint_detail",
+                    reference_id=complaint.reference_id,
+                )
+    else:
+        form = StatusChangeForm(complaint=complaint)
+
+    return render(
+        request,
+        "complaints/complaint_status.html",
+        {
+            "complaint": complaint,
+            "form": form,
+            "has_moves": bool(offerable_transitions(complaint)),
+        },
     )
 
 

@@ -23,12 +23,15 @@ from .models import (
     SubCategory,
 )
 from .services import (
+    STATUS_TRANSITIONS,
     assign_complaint,
     calculate_sla_deadline,
     can_reopen,
     eligible_agents,
+    offerable_transitions,
     override_priority,
     priority_for,
+    transition_status,
 )
 
 
@@ -1328,6 +1331,249 @@ class AttachmentTests(BaseFixture):
         self.client.force_login(self.other)
         response = self.upload("evidence.jpg", self.JPEG)
         self.assertEqual(response.status_code, 403)
+
+
+class StatusTrackingTests(BaseFixture):
+    """SCMS-F-016 / TC-Track-01: the seven states and their history."""
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.sub_category = SubCategory.objects.create(
+            name="Projector", code="projector", category=self.category,
+        )
+
+        profile = self.user.profile
+        profile.role = Role.COMPLAINANT
+        profile.save()
+
+        self.agent = self.make_staff(
+            "agent", Role.SUPPORT_AGENT, self.department,
+        )
+        self.admin = self.make_staff(
+            "itadmin", Role.DEPARTMENT_ADMIN, self.department,
+        )
+
+        self.complaint = self.make_complaint(
+            assigned_department=self.department,
+            assigned_to=self.agent,
+            sub_category=self.sub_category,
+            location="Block C, Room 302",
+            status=Complaint.Status.ASSIGNED,
+        )
+
+    def make_staff(self, username, role, department):
+        user = get_user_model().objects.create_user(
+            username=username, password="not-a-real-password",
+        )
+        profile = user.profile
+        profile.role = role
+        profile.department = department
+        profile.save()
+        return user
+
+    def detail_url(self):
+        return f"/{self.complaint.reference_id}/"
+
+    def status_url(self):
+        return f"/{self.complaint.reference_id}/status/"
+
+    # --- the state machine -------------------------------------------
+
+    def test_every_srs_status_appears_in_the_state_machine(self):
+        self.assertEqual(
+            set(STATUS_TRANSITIONS),
+            set(Complaint.Status.values),
+        )
+
+    def test_closed_is_terminal(self):
+        self.assertEqual(
+            STATUS_TRANSITIONS[Complaint.Status.CLOSED], (),
+        )
+
+    def test_legal_transition_is_recorded(self):
+        transition_status(
+            self.complaint,
+            Complaint.Status.IN_PROGRESS,
+            actor=self.agent,
+        )
+
+        self.complaint.refresh_from_db()
+        self.assertEqual(
+            self.complaint.status, Complaint.Status.IN_PROGRESS,
+        )
+
+        entry = self.complaint.status_history.first()
+        self.assertEqual(entry.old_status, Complaint.Status.ASSIGNED)
+        self.assertEqual(entry.new_status, Complaint.Status.IN_PROGRESS)
+        self.assertEqual(entry.changed_by, self.agent)
+
+    def test_illegal_transition_is_refused(self):
+        """Assigned cannot jump straight to Pending Information."""
+        with self.assertRaises(ValueError):
+            transition_status(
+                self.complaint,
+                Complaint.Status.PENDING_INFORMATION,
+                actor=self.agent,
+            )
+
+        self.complaint.refresh_from_db()
+        self.assertEqual(
+            self.complaint.status, Complaint.Status.ASSIGNED,
+        )
+
+    def test_transition_to_the_current_status_is_refused(self):
+        with self.assertRaises(ValueError):
+            transition_status(
+                self.complaint,
+                Complaint.Status.ASSIGNED,
+                actor=self.agent,
+            )
+
+    def test_resolved_cannot_be_reached_generically(self):
+        """SCMS-F-018 owns Resolved: it needs remarks and proof."""
+        transition_status(
+            self.complaint,
+            Complaint.Status.IN_PROGRESS,
+            actor=self.agent,
+        )
+
+        with self.assertRaises(ValueError):
+            transition_status(
+                self.complaint,
+                Complaint.Status.RESOLVED,
+                actor=self.agent,
+            )
+
+    def test_resolved_is_still_legal_in_the_state_machine(self):
+        """Guarded is not the same as unreachable."""
+        self.assertIn(
+            Complaint.Status.RESOLVED,
+            STATUS_TRANSITIONS[Complaint.Status.IN_PROGRESS],
+        )
+
+    def test_guarded_statuses_are_not_offered(self):
+        transition_status(
+            self.complaint,
+            Complaint.Status.IN_PROGRESS,
+            actor=self.agent,
+        )
+
+        offered = offerable_transitions(self.complaint)
+        self.assertIn(Complaint.Status.PENDING_INFORMATION, offered)
+        self.assertNotIn(Complaint.Status.RESOLVED, offered)
+
+    def test_pending_information_returns_to_in_progress(self):
+        transition_status(
+            self.complaint, Complaint.Status.IN_PROGRESS, actor=self.agent,
+        )
+        transition_status(
+            self.complaint,
+            Complaint.Status.PENDING_INFORMATION,
+            actor=self.agent,
+        )
+        transition_status(
+            self.complaint, Complaint.Status.IN_PROGRESS, actor=self.agent,
+        )
+
+        self.complaint.refresh_from_db()
+        self.assertEqual(
+            self.complaint.status, Complaint.Status.IN_PROGRESS,
+        )
+        self.assertEqual(self.complaint.status_history.count(), 3)
+
+    # --- the tracking page -------------------------------------------
+
+    def test_complainant_sees_the_current_status(self):
+        self.client.force_login(self.user)
+        response = self.client.get(self.detail_url())
+        self.assertContains(response, "Assigned")
+
+    def test_tracking_page_shows_the_category_name(self):
+        """category is a FK, so get_category_display rendered blank."""
+        self.client.force_login(self.user)
+        self.assertContains(
+            self.client.get(self.detail_url()), self.category.name,
+        )
+
+    def test_tracking_page_shows_sub_category_and_location(self):
+        self.client.force_login(self.user)
+        response = self.client.get(self.detail_url())
+        self.assertContains(response, "Projector")
+        self.assertContains(response, "Block C, Room 302")
+
+    def test_tracking_page_shows_dated_transition_history(self):
+        transition_status(
+            self.complaint,
+            Complaint.Status.IN_PROGRESS,
+            actor=self.agent,
+            comment="Engineer scheduled for tomorrow.",
+        )
+
+        self.client.force_login(self.user)
+        response = self.client.get(self.detail_url())
+
+        self.assertContains(response, "In Progress")
+        self.assertContains(response, "Engineer scheduled for tomorrow.")
+        self.assertContains(response, "agent")
+
+    def test_history_is_newest_first(self):
+        transition_status(
+            self.complaint, Complaint.Status.IN_PROGRESS, actor=self.agent,
+        )
+        transition_status(
+            self.complaint,
+            Complaint.Status.PENDING_INFORMATION,
+            actor=self.agent,
+        )
+
+        entries = list(self.complaint.status_history.all())
+        self.assertEqual(
+            entries[0].new_status, Complaint.Status.PENDING_INFORMATION,
+        )
+
+    # --- the status view ---------------------------------------------
+
+    def test_agent_can_move_the_complaint_along(self):
+        self.client.force_login(self.agent)
+        response = self.client.post(self.status_url(), {
+            "status": Complaint.Status.IN_PROGRESS,
+            "comment": "Started work",
+        })
+
+        self.assertEqual(response.status_code, 302)
+        self.complaint.refresh_from_db()
+        self.assertEqual(
+            self.complaint.status, Complaint.Status.IN_PROGRESS,
+        )
+
+    def test_view_does_not_offer_an_illegal_move(self):
+        self.client.force_login(self.agent)
+        response = self.client.get(self.status_url())
+        offered = dict(response.context["form"].fields["status"].choices)
+        self.assertEqual(
+            set(offered), {Complaint.Status.IN_PROGRESS},
+        )
+
+    def test_view_rejects_an_illegal_move_posted_directly(self):
+        self.client.force_login(self.agent)
+        response = self.client.post(self.status_url(), {
+            "status": Complaint.Status.CLOSED,
+            "comment": "",
+        })
+
+        self.assertEqual(response.status_code, 200)
+        self.complaint.refresh_from_db()
+        self.assertEqual(
+            self.complaint.status, Complaint.Status.ASSIGNED,
+        )
+
+    def test_complainant_cannot_change_status(self):
+        self.client.force_login(self.user)
+        self.assertEqual(
+            self.client.get(self.status_url()).status_code, 403,
+        )
 
 
 class RoleFixture(BaseFixture):
