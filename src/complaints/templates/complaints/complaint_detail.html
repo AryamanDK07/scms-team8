@@ -70,6 +70,17 @@
     <p style="white-space: pre-wrap">{{ complaint.description }}</p>
 </div>
 
+{% if complaint.resolution_remarks %}
+<div class="card">
+    {# SCMS-F-018: what was done, and when. #}
+    <h2>Resolution</h2>
+    <p class="muted">
+        Resolved {{ complaint.resolved_at|date:"d M Y, H:i" }}
+    </p>
+    <p style="white-space: pre-wrap">{{ complaint.resolution_remarks }}</p>
+</div>
+{% endif %}
+
 <div class="card">
     <h2>Evidence</h2>
 
