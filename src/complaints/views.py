@@ -10,6 +10,7 @@ from .attachments import MAX_PER_COMPLAINT, canonical_content_type
 from .forms import (
     AssignComplaintForm,
     AttachmentForm,
+    CommentForm,
     ComplaintForm,
     PriorityOverrideForm,
     StatusChangeForm,
@@ -17,12 +18,15 @@ from .forms import (
 from .models import (
     Complaint,
     ComplaintAttachment,
+    ComplaintComment,
     ComplaintStatusHistory,
 )
 from .permissions import require_complaint_access, role_required
 from .roles import Role, STAFF_ROLES, get_department, get_role
 from .services import (
+    add_comment,
     assign_complaint,
+    comment_thread,
     offerable_transitions,
     override_priority,
     priority_for,
@@ -138,6 +142,69 @@ def complaint_detail(request, reference_id):
         {
             "complaint": complaint,
             "history": history,
+            "thread": comment_thread(complaint),
+            "comment_form": CommentForm(),
+        },
+    )
+
+
+@login_required
+def complaint_comment_add(request, reference_id):
+    """Post a comment or a reply on a complaint (SCMS-F-017).
+
+    Access follows the complaint, so the complainant and the
+    assigned agent can both post, and another complainant cannot
+    reach it at all.
+    """
+    complaint = get_object_or_404(Complaint, reference_id=reference_id)
+
+    require_complaint_access(complaint, request.user)
+
+    if request.method != "POST":
+        return redirect(
+            "complaints:complaint_detail",
+            reference_id=complaint.reference_id,
+        )
+
+    form = CommentForm(request.POST)
+
+    if form.is_valid():
+        parent = None
+        parent_id = form.cleaned_data.get("parent")
+
+        if parent_id:
+            # Scoped to this complaint: a parent id from elsewhere
+            # must not resolve, or a reply could be attached to a
+            # conversation the author cannot see.
+            parent = get_object_or_404(
+                ComplaintComment, pk=parent_id, complaint=complaint,
+            )
+
+        try:
+            add_comment(
+                complaint,
+                author=request.user,
+                body=form.cleaned_data["body"],
+                parent=parent,
+            )
+        except ValueError as error:
+            form.add_error(None, str(error))
+        else:
+            return redirect(
+                "complaints:complaint_detail",
+                reference_id=complaint.reference_id,
+            )
+
+    history = complaint.status_history.select_related("changed_by").all()
+
+    return render(
+        request,
+        "complaints/complaint_detail.html",
+        {
+            "complaint": complaint,
+            "history": history,
+            "thread": comment_thread(complaint),
+            "comment_form": form,
         },
     )
 

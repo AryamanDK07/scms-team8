@@ -3,7 +3,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.forms import AuthenticationForm
 
 from .attachments import AttachmentRejected, validate_upload
-from .models import Category, Complaint, SubCategory
+from .models import Category, Complaint, ComplaintComment, SubCategory
 from .services import eligible_agents, offerable_transitions
 
 
@@ -79,6 +79,37 @@ class PriorityOverrideForm(forms.Form):
             )
 
         return reason
+
+
+class CommentForm(forms.Form):
+    """Post a comment or a reply on a complaint (SCMS-F-017)."""
+
+    body = forms.CharField(
+        label="Comment",
+        widget=forms.Textarea(attrs={
+            "rows": 3,
+            "maxlength": ComplaintComment.BODY_LIMIT,
+            "placeholder": "Add a note for the other party",
+        }),
+    )
+    parent = forms.IntegerField(
+        required=False,
+        widget=forms.HiddenInput(),
+    )
+
+    def clean_body(self):
+        body = self.cleaned_data["body"].strip()
+
+        if not body:
+            raise forms.ValidationError("A comment cannot be empty.")
+
+        if len(body) > ComplaintComment.BODY_LIMIT:
+            raise forms.ValidationError(
+                f"Keep a comment to {ComplaintComment.BODY_LIMIT} "
+                f"characters or fewer."
+            )
+
+        return body
 
 
 class AttachmentForm(forms.Form):

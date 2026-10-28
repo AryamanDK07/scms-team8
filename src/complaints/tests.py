@@ -18,15 +18,18 @@ from .models import (
     Category,
     Complaint,
     ComplaintAttachment,
+    ComplaintComment,
     ComplaintStatusHistory,
     Department,
     SubCategory,
 )
 from .services import (
     STATUS_TRANSITIONS,
+    add_comment,
     assign_complaint,
     calculate_sla_deadline,
     can_reopen,
+    comment_thread,
     eligible_agents,
     offerable_transitions,
     override_priority,
@@ -1573,6 +1576,192 @@ class StatusTrackingTests(BaseFixture):
         self.client.force_login(self.user)
         self.assertEqual(
             self.client.get(self.status_url()).status_code, 403,
+        )
+
+
+class CommentTests(BaseFixture):
+    """SCMS-F-017 / TC-Track-02: both parties, and nobody else."""
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.estates = Department.objects.create(
+            name="Estates", code="estates",
+        )
+
+        profile = self.user.profile
+        profile.role = Role.COMPLAINANT
+        profile.save()
+
+        self.agent = self.make_staff(
+            "agent", Role.SUPPORT_AGENT, self.department,
+        )
+        self.other_agent = self.make_staff(
+            "estatesagent", Role.SUPPORT_AGENT, self.estates,
+        )
+        self.other_complainant = get_user_model().objects.create_user(
+            username="other", password="not-a-real-password",
+        )
+
+        self.complaint = self.make_complaint(
+            assigned_department=self.department,
+            assigned_to=self.agent,
+        )
+
+    def make_staff(self, username, role, department):
+        user = get_user_model().objects.create_user(
+            username=username, password="not-a-real-password",
+        )
+        profile = user.profile
+        profile.role = role
+        profile.department = department
+        profile.save()
+        return user
+
+    def url(self):
+        return f"/{self.complaint.reference_id}/comment/"
+
+    def detail_url(self):
+        return f"/{self.complaint.reference_id}/"
+
+    def post(self, body, parent=None):
+        data = {"body": body}
+        if parent is not None:
+            data["parent"] = parent
+        return self.client.post(self.url(), data)
+
+    # --- posting -----------------------------------------------------
+
+    def test_complainant_can_comment(self):
+        self.client.force_login(self.user)
+        response = self.post("The projector is still dead.")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.complaint.comments.count(), 1)
+
+    def test_assigned_agent_can_comment(self):
+        self.client.force_login(self.agent)
+        self.post("An engineer is booked for Tuesday.")
+
+        self.assertEqual(self.complaint.comments.count(), 1)
+
+    def test_empty_comment_is_refused(self):
+        self.client.force_login(self.user)
+        self.post("   ")
+
+        self.assertFalse(self.complaint.comments.exists())
+
+    def test_overlong_comment_is_refused(self):
+        self.client.force_login(self.user)
+        self.post("x" * (ComplaintComment.BODY_LIMIT + 1))
+
+        self.assertFalse(self.complaint.comments.exists())
+
+    def test_body_is_stored_stripped(self):
+        self.client.force_login(self.user)
+        self.post("  padded  ")
+
+        self.assertEqual(self.complaint.comments.get().body, "padded")
+
+    # --- visibility, which is the acceptance criterion ---------------
+
+    def test_both_parties_see_each_others_comments(self):
+        self.client.force_login(self.user)
+        self.post("From the complainant.")
+
+        self.client.force_login(self.agent)
+        self.post("From the agent.")
+
+        for actor in (self.user, self.agent):
+            self.client.force_login(actor)
+            page = self.client.get(self.detail_url())
+            self.assertContains(page, "From the complainant.")
+            self.assertContains(page, "From the agent.")
+
+    def test_another_complainant_cannot_read_the_thread(self):
+        self.client.force_login(self.user)
+        self.post("Private to this complaint.")
+
+        self.client.force_login(self.other_complainant)
+        self.assertEqual(
+            self.client.get(self.detail_url()).status_code, 403,
+        )
+
+    def test_another_complainant_cannot_post(self):
+        self.client.force_login(self.other_complainant)
+        response = self.post("Butting in.")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(self.complaint.comments.exists())
+
+    def test_agent_from_another_department_cannot_post(self):
+        self.client.force_login(self.other_agent)
+        response = self.post("Not my complaint.")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(self.complaint.comments.exists())
+
+    def test_anonymous_is_sent_to_login(self):
+        response = self.post("Anonymous.")
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/accounts/login/", response["Location"])
+
+    # --- threading ---------------------------------------------------
+
+    def test_reply_attaches_to_its_parent(self):
+        self.client.force_login(self.user)
+        self.post("Original question.")
+        parent = self.complaint.comments.get()
+
+        self.client.force_login(self.agent)
+        self.post("Answer.", parent=parent.pk)
+
+        reply = self.complaint.comments.exclude(pk=parent.pk).get()
+        self.assertEqual(reply.parent, parent)
+        self.assertEqual(list(parent.replies.all()), [reply])
+
+    def test_reply_to_a_reply_is_refused(self):
+        """One level deep: deeper nesting helps nobody read it."""
+        parent = add_comment(self.complaint, self.user, "Original.")
+        reply = add_comment(
+            self.complaint, self.agent, "Answer.", parent=parent,
+        )
+
+        with self.assertRaises(ValueError):
+            add_comment(
+                self.complaint, self.user, "Nested.", parent=reply,
+            )
+
+    def test_reply_cannot_cross_complaints(self):
+        """A parent id from another complaint must not resolve."""
+        other = self.make_complaint(assigned_department=self.department)
+        elsewhere = add_comment(other, self.user, "Over here.")
+
+        self.client.force_login(self.user)
+        response = self.post("Smuggled.", parent=elsewhere.pk)
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(other.comments.count(), 1)
+
+    def test_service_refuses_a_parent_from_another_complaint(self):
+        other = self.make_complaint(assigned_department=self.department)
+        elsewhere = add_comment(other, self.user, "Over here.")
+
+        with self.assertRaises(ValueError):
+            add_comment(
+                self.complaint, self.user, "Smuggled.", parent=elsewhere,
+            )
+
+    def test_thread_is_oldest_first_with_replies_grouped(self):
+        first = add_comment(self.complaint, self.user, "First.")
+        add_comment(self.complaint, self.agent, "Reply.", parent=first)
+        add_comment(self.complaint, self.user, "Second.")
+
+        thread = list(comment_thread(self.complaint))
+        self.assertEqual([c.body for c in thread], ["First.", "Second."])
+        self.assertEqual(
+            [r.body for r in thread[0].replies.all()], ["Reply."],
         )
 
 

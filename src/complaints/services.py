@@ -5,7 +5,12 @@ from django.db import transaction
 from django.db.models import F
 from django.utils import timezone
 
-from .models import Complaint, ComplaintStatusHistory, ReferenceSequence
+from .models import (
+    Complaint,
+    ComplaintComment,
+    ComplaintStatusHistory,
+    ReferenceSequence,
+)
 
 
 # How long a complainant may reopen a resolved complaint (SCMS-F-019).
@@ -295,6 +300,55 @@ def assign_complaint(complaint, agent, actor, reason="", source_ip=None):
         )
 
     return complaint
+
+
+def add_comment(complaint, author, body, parent=None):
+    """Post a comment or a reply on a complaint (SCMS-F-017).
+
+    The parent checks matter: a reply carries its parent's id from
+    the form, so without them a client could attach a reply to a
+    comment on someone else's complaint and have it surface there.
+    """
+    text = (body or "").strip()
+
+    if not text:
+        raise ValueError("A comment cannot be empty.")
+
+    if len(text) > ComplaintComment.BODY_LIMIT:
+        raise ValueError(
+            f"Keep a comment to {ComplaintComment.BODY_LIMIT} "
+            f"characters or fewer."
+        )
+
+    if parent is not None:
+        if parent.complaint_id != complaint.pk:
+            raise ValueError(
+                "That comment belongs to a different complaint."
+            )
+
+        if parent.parent_id is not None:
+            raise ValueError(
+                "Replies go on the original comment, not on another "
+                "reply."
+            )
+
+    return ComplaintComment.objects.create(
+        complaint=complaint,
+        parent=parent,
+        author=author,
+        body=text,
+    )
+
+
+def comment_thread(complaint):
+    """Top-level comments with their replies, oldest first."""
+    return (
+        complaint.comments
+        .filter(parent__isnull=True)
+        .select_related("author")
+        .prefetch_related("replies__author")
+        .order_by("created_at")
+    )
 
 
 def can_reopen(complaint, now=None):

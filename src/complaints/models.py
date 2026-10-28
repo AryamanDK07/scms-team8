@@ -294,6 +294,50 @@ class ComplaintStatusHistory(models.Model):
         )
 
 
+class ComplaintComment(models.Model):
+    """A message on a complaint (SCMS-F-017).
+
+    Threading is one level deep: a comment may reply to a top-level
+    comment, but not to another reply. Unbounded nesting makes a
+    conversation harder to follow, not easier, and nothing in the
+    requirement asks for it.
+
+    Who may read or write a comment follows the complaint itself,
+    through the existing object-level check, so a comment is visible
+    to the complainant and the assigned agent and to no other
+    complainant.
+    """
+
+    BODY_LIMIT = 2000
+
+    complaint = models.ForeignKey(
+        Complaint,
+        on_delete=models.PROTECT,
+        related_name="comments",
+    )
+    parent = models.ForeignKey(
+        "self",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="replies",
+        help_text="The comment this one replies to, if any.",
+    )
+    author = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="complaint_comments",
+    )
+    body = models.TextField(max_length=BODY_LIMIT)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["created_at"]
+
+    def __str__(self):
+        return f"{self.complaint.reference_id}: {self.author}"
+
+
 def attachment_path(instance, filename):
     """Store under a random name, keyed by complaint reference.
 
