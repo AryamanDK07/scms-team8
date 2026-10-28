@@ -45,14 +45,76 @@ complaint stands.
 
 ## Repository structure
 
+```
+scms-team8/
+├── docs/                     SRS, SAD and Test Plan
+├── requirements.txt
+└── src/
+    ├── manage.py
+    ├── config/               Django project settings and root URLs
+    │   ├── settings.py       PostgreSQL, the deployment target
+    │   └── settings_local.py SQLite, for running on a dev machine
+    └── complaints/           The application
+        ├── models.py         Complaint, Category, attachments, audit trail
+        ├── services.py       Reference IDs, routing, SLA, state machine
+        ├── roles.py          The four SRS roles
+        ├── permissions.py    Deny-by-default authorisation
+        ├── attachments.py    Evidence validation (SCMS-F-008)
+        ├── forms.py, views.py, urls.py, admin.py
+        ├── migrations/
+        ├── templates/
+        └── tests.py
+```
 
+---
 
+## Running it locally
 
+Needs Python 3.11 or newer.
 
+```bash
+git clone https://github.com/AryamanDK07/scms-team8.git
+cd scms-team8
+python -m venv .venv
+.venv\Scripts\activate          # Windows
+source .venv/bin/activate       # macOS or Linux
+pip install -r requirements.txt
+```
 
+**Without installing a database server.** `config.settings_local`
+uses a SQLite file, so there is nothing to install or configure:
 
+```bash
+cd src
+python manage.py migrate --settings=config.settings_local
+python manage.py createsuperuser --settings=config.settings_local
+python manage.py runserver --settings=config.settings_local
+```
 
+Then open http://127.0.0.1:8000/. Sign in with the superuser you
+just created; http://127.0.0.1:8000/admin/ is where you add the
+departments and categories that complaints are routed by.
 
+**Against PostgreSQL**, which is what the SAD specifies for
+deployment: create the database and user, put the credentials in a
+`.env` file in the repository root, and leave `--settings` off.
+
+```
+DB_NAME=scms_db
+DB_USER=scms_user
+DB_PASSWORD=your-password
+DB_HOST=127.0.0.1
+DB_PORT=5432
+```
+
+`.env` is git-ignored and must never be committed.
+
+### Running the tests
+
+```bash
+cd src
+python manage.py test complaints --settings=config.settings_local
+```
 
 ---
 
