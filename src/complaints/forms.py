@@ -4,7 +4,7 @@ from django.contrib.auth.forms import AuthenticationForm
 
 from .attachments import AttachmentRejected, validate_upload
 from .models import Category, Complaint, SubCategory
-from .services import eligible_agents
+from .services import eligible_agents, offerable_transitions
 
 
 class EmailLoginForm(AuthenticationForm):
@@ -112,6 +112,36 @@ class AttachmentForm(forms.Form):
             raise forms.ValidationError(str(rejection))
 
         return upload
+
+
+class StatusChangeForm(forms.Form):
+    """Move a complaint along the state machine (SCMS-F-016).
+
+    The choices are built from the complaint's current status, so
+    an illegal transition is never offered in the first place.
+    """
+
+    status = forms.ChoiceField(choices=(), label="Move to")
+    comment = forms.CharField(
+        required=False,
+        widget=forms.Textarea(attrs={
+            "rows": 3,
+            "placeholder": "Anything the complainant should know",
+        }),
+        help_text="Shown to the complainant on their tracking page.",
+    )
+
+    def __init__(self, *args, complaint=None, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.complaint = complaint
+        labels = dict(Complaint.Status.choices)
+
+        if complaint is not None:
+            self.fields["status"].choices = [
+                (status, labels.get(status, status))
+                for status in offerable_transitions(complaint)
+            ]
 
 
 class AssignComplaintForm(forms.Form):

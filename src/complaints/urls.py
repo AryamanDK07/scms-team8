@@ -40,6 +40,11 @@ urlpatterns = [
         name="complaint_priority",
     ),
     path(
+        "<ref:reference_id>/status/",
+        views.complaint_status,
+        name="complaint_status",
+    ),
+    path(
         "<ref:reference_id>/attach/",
         views.complaint_attachment_add,
         name="complaint_attachment_add",

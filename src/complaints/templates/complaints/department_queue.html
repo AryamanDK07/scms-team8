@@ -15,7 +15,7 @@
         <th>Status</th>
         <th>Assigned to</th>
         <th>SLA due</th>
-        {% if can_assign %}<th></th>{% endif %}
+        <th>Actions</th>
       </tr>
     </thead>
     <tbody>
@@ -33,8 +33,14 @@
           <td>{{ complaint.get_status_display }}</td>
           <td>{{ complaint.assigned_to|default:"Unassigned" }}</td>
           <td>{{ complaint.sla_due_at|date:"d M Y H:i"|default:"-" }}</td>
-          {% if can_assign %}
-            <td>
+          <td>
+            {# Any staff member may move a complaint along; only a
+               Department Admin or System Admin may reassign it. #}
+            <a href="{% url 'complaints:complaint_status' complaint.reference_id %}">
+              Status
+            </a>
+            {% if can_assign %}
+              &middot;
               <a href="{% url 'complaints:complaint_assign' complaint.reference_id %}">
                 {% if complaint.assigned_to %}Reassign{% else %}Assign{% endif %}
               </a>
@@ -42,8 +48,8 @@
               <a href="{% url 'complaints:complaint_priority' complaint.reference_id %}">
                 Priority
               </a>
-            </td>
-          {% endif %}
+            {% endif %}
+          </td>
         </tr>
       {% empty %}
         <tr><td colspan="9">No complaints in your queue.</td></tr>
