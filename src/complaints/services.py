@@ -302,6 +302,101 @@ def assign_complaint(complaint, agent, actor, reason="", source_ip=None):
     return complaint
 
 
+#: Minimum length of resolution remarks (SCMS-F-018).
+RESOLUTION_REMARKS_MIN = 50
+
+
+def resolve_complaint(
+    complaint, actor, remarks, proof_uploads=(), source_ip=None,
+):
+    """Mark a complaint resolved, with remarks and proof.
+
+    SCMS-F-018 requires both, which is why T8-23 guards Resolved
+    against the generic status change: this is the only route to it,
+    and it cannot be taken without the evidence.
+
+    Proof files are stored as attachments of kind PROOF, counted
+    separately from the complainant's evidence allowance under
+    SCMS-F-008. Sharing one allowance would let a complainant who
+    attached three files block their own complaint from ever being
+    resolved.
+    """
+    from .attachments import AttachmentRejected, validate_upload
+    from .models import AttachmentKind, ComplaintAttachment
+
+    if Complaint.Status.RESOLVED not in allowed_transitions(complaint):
+        raise ValueError(
+            f"A complaint that is "
+            f"{complaint.get_status_display()} cannot be resolved."
+        )
+
+    text = (remarks or "").strip()
+
+    if len(text) < RESOLUTION_REMARKS_MIN:
+        raise ValueError(
+            f"Resolution remarks must be at least "
+            f"{RESOLUTION_REMARKS_MIN} characters. "
+            f"They are currently {len(text)}."
+        )
+
+    uploads = list(proof_uploads)
+    already_held = complaint.attachments.filter(
+        kind=AttachmentKind.PROOF,
+    ).count()
+
+    if not uploads and already_held == 0:
+        raise ValueError(
+            "At least one proof file is required before a complaint "
+            "can be resolved."
+        )
+
+    # Validate every upload before writing anything, so a rejected
+    # second file does not leave the first one stored against a
+    # complaint that was never resolved.
+    checked = []
+    for index, upload in enumerate(uploads):
+        try:
+            label = validate_upload(upload, already_held + index)
+        except AttachmentRejected as rejection:
+            raise ValueError(str(rejection))
+
+        checked.append((upload, label))
+
+    from .attachments import canonical_content_type
+
+    old_status = complaint.status
+
+    with transaction.atomic():
+        for upload, label in checked:
+            ComplaintAttachment.objects.create(
+                complaint=complaint,
+                kind=AttachmentKind.PROOF,
+                file=upload,
+                original_name=upload.name[:255],
+                content_type=canonical_content_type(label),
+                size_bytes=upload.size,
+                uploaded_by=actor,
+            )
+
+        complaint.status = Complaint.Status.RESOLVED
+        complaint.resolution_remarks = text
+        complaint.resolved_at = timezone.now()
+        complaint.save(update_fields=[
+            "status", "resolution_remarks", "resolved_at", "updated_at",
+        ])
+
+        ComplaintStatusHistory.objects.create(
+            complaint=complaint,
+            old_status=old_status,
+            new_status=Complaint.Status.RESOLVED,
+            changed_by=actor,
+            source_ip=source_ip,
+            comment=f"Resolved. {text}",
+        )
+
+    return complaint
+
+
 def add_comment(complaint, author, body, parent=None):
     """Post a comment or a reply on a complaint (SCMS-F-017).
 

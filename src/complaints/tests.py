@@ -15,6 +15,7 @@ from django.utils import timezone
 
 from .attachments import MAX_BYTES
 from .models import (
+    AttachmentKind,
     Category,
     Complaint,
     ComplaintAttachment,
@@ -34,6 +35,8 @@ from .services import (
     offerable_transitions,
     override_priority,
     priority_for,
+    RESOLUTION_REMARKS_MIN,
+    resolve_complaint,
     transition_status,
 )
 
@@ -1837,6 +1840,202 @@ class RoleAdminTests(BaseFixture):
 
         response = self.client.get("/admin/auth/user/")
         self.assertContains(response, "Department Admin")
+
+
+class ResolutionTests(BaseFixture):
+    """SCMS-F-018 / TC-Res-01: remarks and proof, or no resolution."""
+
+    JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
+    EXE = b"MZ\x90\x00" + b"\x00" * 64
+    GOOD_REMARKS = (
+        "Replaced the failed projector lamp module and confirmed "
+        "the unit powers on and displays correctly."
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._media_root = tempfile.mkdtemp()
+        cls._media_override = override_settings(MEDIA_ROOT=cls._media_root)
+        cls._media_override.enable()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._media_override.disable()
+        shutil.rmtree(cls._media_root, ignore_errors=True)
+        super().tearDownClass()
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.agent = get_user_model().objects.create_user(
+            username="agent", password="not-a-real-password",
+        )
+        profile = self.agent.profile
+        profile.role = Role.SUPPORT_AGENT
+        profile.department = self.department
+        profile.save()
+
+        self.complaint = self.make_complaint(
+            assigned_department=self.department,
+            assigned_to=self.agent,
+            status=Complaint.Status.IN_PROGRESS,
+        )
+        self.client.force_login(self.agent)
+
+    def url(self):
+        return f"/{self.complaint.reference_id}/resolve/"
+
+    def proof(self, name="fixed.jpg", content=None):
+        return SimpleUploadedFile(
+            name, content or self.JPEG, "image/jpeg",
+        )
+
+    def post(self, remarks=None, proof=True):
+        data = {"remarks": self.GOOD_REMARKS if remarks is None else remarks}
+        if proof:
+            data["proof"] = self.proof()
+        return self.client.post(self.url(), data)
+
+    def assert_not_resolved(self):
+        self.complaint.refresh_from_db()
+        self.assertNotEqual(
+            self.complaint.status, Complaint.Status.RESOLVED,
+        )
+        self.assertEqual(self.complaint.resolution_remarks, "")
+        self.assertIsNone(self.complaint.resolved_at)
+
+    # --- the happy path ----------------------------------------------
+
+    def test_remarks_and_proof_resolve_the_complaint(self):
+        response = self.post()
+
+        self.assertEqual(response.status_code, 302)
+        self.complaint.refresh_from_db()
+        self.assertEqual(
+            self.complaint.status, Complaint.Status.RESOLVED,
+        )
+        self.assertEqual(
+            self.complaint.resolution_remarks, self.GOOD_REMARKS,
+        )
+        self.assertIsNotNone(self.complaint.resolved_at)
+
+    def test_proof_is_stored_as_proof_not_evidence(self):
+        self.post()
+
+        attachment = self.complaint.attachments.get()
+        self.assertEqual(attachment.kind, AttachmentKind.PROOF)
+        self.assertEqual(attachment.uploaded_by, self.agent)
+
+    def test_resolution_is_recorded_in_the_audit_trail(self):
+        self.post()
+
+        entry = self.complaint.status_history.first()
+        self.assertEqual(entry.new_status, Complaint.Status.RESOLVED)
+        self.assertEqual(entry.changed_by, self.agent)
+        self.assertIn("Replaced the failed projector", entry.comment)
+
+    # --- the refusals the criterion names -----------------------------
+
+    def test_no_remarks_is_refused(self):
+        self.post(remarks="")
+        self.assert_not_resolved()
+
+    def test_short_remarks_are_refused(self):
+        self.post(remarks="Fixed it.")
+        self.assert_not_resolved()
+
+    def test_remarks_just_under_the_limit_are_refused(self):
+        self.post(remarks="x" * (RESOLUTION_REMARKS_MIN - 1))
+        self.assert_not_resolved()
+
+    def test_remarks_at_exactly_the_limit_are_accepted(self):
+        response = self.post(remarks="x" * RESOLUTION_REMARKS_MIN)
+
+        self.assertEqual(response.status_code, 302)
+        self.complaint.refresh_from_db()
+        self.assertEqual(
+            self.complaint.status, Complaint.Status.RESOLVED,
+        )
+
+    def test_whitespace_padding_does_not_count_towards_the_minimum(self):
+        self.post(remarks="   " + "x" * 10 + "   " * 20)
+        self.assert_not_resolved()
+
+    def test_no_proof_is_refused(self):
+        self.post(proof=False)
+        self.assert_not_resolved()
+
+    def test_an_executable_as_proof_is_refused(self):
+        self.client.post(self.url(), {
+            "remarks": self.GOOD_REMARKS,
+            "proof": self.proof("payload.jpg", self.EXE),
+        })
+        self.assert_not_resolved()
+        self.assertFalse(self.complaint.attachments.exists())
+
+    # --- the state machine --------------------------------------------
+
+    def test_an_open_complaint_cannot_be_resolved(self):
+        self.complaint.status = Complaint.Status.OPEN
+        self.complaint.save(update_fields=["status"])
+
+        self.post()
+        self.assert_not_resolved()
+
+    def test_service_refuses_resolution_from_a_wrong_status(self):
+        self.complaint.status = Complaint.Status.ASSIGNED
+        self.complaint.save(update_fields=["status"])
+
+        with self.assertRaises(ValueError):
+            resolve_complaint(
+                self.complaint,
+                actor=self.agent,
+                remarks=self.GOOD_REMARKS,
+                proof_uploads=[self.proof()],
+            )
+
+    def test_generic_status_change_still_cannot_reach_resolved(self):
+        """The guard from T8-23 is what makes this flow the only way."""
+        with self.assertRaises(ValueError):
+            transition_status(
+                self.complaint,
+                Complaint.Status.RESOLVED,
+                actor=self.agent,
+            )
+
+    # --- the allowance question ----------------------------------------
+
+    def test_proof_does_not_consume_the_complainant_evidence_limit(self):
+        """Three pieces of evidence must not block resolution."""
+        for index in range(3):
+            upload = SimpleUploadedFile(
+                f"evidence{index}.jpg", self.JPEG, "image/jpeg",
+            )
+            ComplaintAttachment.objects.create(
+                complaint=self.complaint,
+                kind=AttachmentKind.EVIDENCE,
+                file=upload,
+                original_name=upload.name,
+                content_type="image/jpeg",
+                size_bytes=upload.size,
+                uploaded_by=self.user,
+            )
+
+        response = self.post()
+
+        self.assertEqual(response.status_code, 302)
+        self.complaint.refresh_from_db()
+        self.assertEqual(
+            self.complaint.status, Complaint.Status.RESOLVED,
+        )
+
+    # --- access --------------------------------------------------------
+
+    def test_complainant_cannot_resolve_their_own_complaint(self):
+        self.client.force_login(self.user)
+        self.assertEqual(self.client.get(self.url()).status_code, 403)
 
 
 class RoleFixture(BaseFixture):

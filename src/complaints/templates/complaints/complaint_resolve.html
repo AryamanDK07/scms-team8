@@ -1,0 +1,57 @@
+
+{% extends "complaints/base.html" %}
+
+{% block title %}Resolve {{ complaint.reference_id }} | SCMS{% endblock %}
+
+{% block content %}
+<div class="card">
+    <h1>Resolve {{ complaint.reference_id }}</h1>
+
+    <p class="muted">{{ complaint.title }}</p>
+
+    {% if resolvable %}
+        <p>
+            Resolving needs an account of what was done and at least
+            one file showing it. Both are kept on the complaint and
+            shown to the complainant.
+        </p>
+
+        <form method="post" enctype="multipart/form-data">
+            {% csrf_token %}
+
+            {% for error in form.non_field_errors %}
+                <p class="errorlist">{{ error }}</p>
+            {% endfor %}
+
+            {% for field in form %}
+                <p>
+                    {{ field.label_tag }}
+                    {{ field }}
+
+                    {% if field.help_text %}
+                        <span class="muted">{{ field.help_text }}</span>
+                    {% endif %}
+
+                    {% for error in field.errors %}
+                        <span class="errorlist">{{ error }}</span>
+                    {% endfor %}
+                </p>
+            {% endfor %}
+
+            <button type="submit" class="button">Mark resolved</button>
+        </form>
+    {% else %}
+        <p class="errorlist">
+            A complaint that is
+            <strong>{{ complaint.get_status_display }}</strong>
+            cannot be resolved. Only one that is In Progress can be.
+        </p>
+    {% endif %}
+
+    <p class="muted">
+        <a href="{% url 'complaints:complaint_detail' complaint.reference_id %}">
+            Back to complaint
+        </a>
+    </p>
+</div>
+{% endblock %}

@@ -210,6 +210,12 @@ class Complaint(models.Model):
 
     sla_due_at = models.DateTimeField(null=True, blank=True)
     resolved_at = models.DateTimeField(null=True, blank=True)
+    resolution_remarks = models.TextField(
+        blank=True,
+        help_text=(
+            "What was done, in at least 50 characters (SCMS-F-018)."
+        ),
+    )
     reopened_at = models.DateTimeField(null=True, blank=True)
     reopen_count = models.PositiveSmallIntegerField(
         default=0,
@@ -354,6 +360,19 @@ def attachment_path(instance, filename):
     )
 
 
+class AttachmentKind(models.TextChoices):
+    """What an attachment is for.
+
+    SCMS-F-008 caps a complainant's evidence at three files.
+    Resolution proof under SCMS-F-018 is counted separately: if the
+    two shared one allowance, a complainant who attached three files
+    would make their own complaint impossible to resolve.
+    """
+
+    EVIDENCE = "EVIDENCE", "Complainant evidence"
+    PROOF = "PROOF", "Resolution proof"
+
+
 class ComplaintAttachment(models.Model):
     """Evidence supporting a complaint (SCMS-F-008).
 
@@ -367,6 +386,11 @@ class ComplaintAttachment(models.Model):
         Complaint,
         on_delete=models.PROTECT,
         related_name="attachments",
+    )
+    kind = models.CharField(
+        max_length=10,
+        choices=AttachmentKind.choices,
+        default=AttachmentKind.EVIDENCE,
     )
     file = models.FileField(upload_to=attachment_path)
     original_name = models.CharField(

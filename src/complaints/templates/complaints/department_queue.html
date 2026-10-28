@@ -39,6 +39,10 @@
             <a href="{% url 'complaints:complaint_status' complaint.reference_id %}">
               Status
             </a>
+            &middot;
+            <a href="{% url 'complaints:complaint_resolve' complaint.reference_id %}">
+              Resolve
+            </a>
             {% if can_assign %}
               &middot;
               <a href="{% url 'complaints:complaint_assign' complaint.reference_id %}">

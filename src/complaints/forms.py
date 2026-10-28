@@ -3,8 +3,18 @@ from django.contrib.auth import get_user_model
 from django.contrib.auth.forms import AuthenticationForm
 
 from .attachments import AttachmentRejected, validate_upload
-from .models import Category, Complaint, ComplaintComment, SubCategory
-from .services import eligible_agents, offerable_transitions
+from .models import (
+    AttachmentKind,
+    Category,
+    Complaint,
+    ComplaintComment,
+    SubCategory,
+)
+from .services import (
+    RESOLUTION_REMARKS_MIN,
+    eligible_agents,
+    offerable_transitions,
+)
 
 
 class EmailLoginForm(AuthenticationForm):
@@ -79,6 +89,60 @@ class PriorityOverrideForm(forms.Form):
             )
 
         return reason
+
+
+class ResolutionForm(forms.Form):
+    """Record a resolution with remarks and proof (SCMS-F-018)."""
+
+    remarks = forms.CharField(
+        label="Resolution remarks",
+        widget=forms.Textarea(attrs={
+            "rows": 5,
+            "placeholder": (
+                "What was wrong, what was done, and how it was checked"
+            ),
+        }),
+        help_text=(
+            f"At least {RESOLUTION_REMARKS_MIN} characters. This is "
+            f"what the complainant reads, so write it for them."
+        ),
+    )
+    proof = forms.FileField(
+        label="Proof of resolution",
+        help_text="JPG, PNG or PDF, up to 5 MB.",
+    )
+
+    def __init__(self, *args, complaint=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.complaint = complaint
+
+    def clean_remarks(self):
+        remarks = self.cleaned_data["remarks"].strip()
+
+        if len(remarks) < RESOLUTION_REMARKS_MIN:
+            raise forms.ValidationError(
+                f"Give at least {RESOLUTION_REMARKS_MIN} characters. "
+                f"That is {len(remarks)} so far."
+            )
+
+        return remarks
+
+    def clean_proof(self):
+        upload = self.cleaned_data["proof"]
+        existing = (
+            self.complaint.attachments.filter(
+                kind=AttachmentKind.PROOF,
+            ).count()
+            if self.complaint is not None
+            else 0
+        )
+
+        try:
+            self.detected_format = validate_upload(upload, existing)
+        except AttachmentRejected as rejection:
+            raise forms.ValidationError(str(rejection))
+
+        return upload
 
 
 class CommentForm(forms.Form):

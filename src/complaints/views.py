@@ -13,6 +13,7 @@ from .forms import (
     CommentForm,
     ComplaintForm,
     PriorityOverrideForm,
+    ResolutionForm,
     StatusChangeForm,
 )
 from .models import (
@@ -25,11 +26,13 @@ from .permissions import require_complaint_access, role_required
 from .roles import Role, STAFF_ROLES, get_department, get_role
 from .services import (
     add_comment,
+    allowed_transitions,
     assign_complaint,
     comment_thread,
     offerable_transitions,
     override_priority,
     priority_for,
+    resolve_complaint,
     transition_status,
 )
 
@@ -382,6 +385,67 @@ def complaint_priority(request, reference_id):
         request,
         "complaints/complaint_priority.html",
         {"complaint": complaint, "form": form},
+    )
+
+
+@role_required(*STAFF_ROLES)
+def complaint_resolve(request, reference_id):
+    """Resolve a complaint with remarks and proof (SCMS-F-018).
+
+    This is the only route to Resolved: the generic status change
+    guards against it precisely so that a complaint cannot be
+    closed off without the evidence this view requires.
+    """
+    complaint = get_object_or_404(
+        Complaint.objects.select_related(
+            "assigned_department", "assigned_to", "category",
+        ),
+        reference_id=reference_id,
+    )
+
+    require_complaint_access(complaint, request.user, write=True)
+
+    resolvable = (
+        Complaint.Status.RESOLVED in allowed_transitions(complaint)
+    )
+
+    if request.method == "POST" and resolvable:
+        form = ResolutionForm(
+            request.POST, request.FILES, complaint=complaint,
+        )
+
+        if form.is_valid():
+            try:
+                resolve_complaint(
+                    complaint,
+                    actor=request.user,
+                    remarks=form.cleaned_data["remarks"],
+                    proof_uploads=[form.cleaned_data["proof"]],
+                    source_ip=request.META.get("REMOTE_ADDR"),
+                )
+            except ValueError as error:
+                form.add_error(None, str(error))
+            else:
+                messages.success(
+                    request,
+                    f"{complaint.reference_id} marked resolved.",
+                )
+
+                return redirect(
+                    "complaints:complaint_detail",
+                    reference_id=complaint.reference_id,
+                )
+    else:
+        form = ResolutionForm(complaint=complaint)
+
+    return render(
+        request,
+        "complaints/complaint_resolve.html",
+        {
+            "complaint": complaint,
+            "form": form,
+            "resolvable": resolvable,
+        },
     )
 
 
