@@ -4,6 +4,29 @@
   <h1>Complaint queue</h1>
   <p>Showing complaints visible to your role.</p>
 
+  {# SCMS-F-028. Filters narrow what your role already allows; they
+     never widen it. #}
+  <div class="card">
+    <form method="get">
+      {% for error in search.non_field_errors %}
+        <p class="errorlist">{{ error }}</p>
+      {% endfor %}
+
+      {% for field in search %}
+        <span style="display:inline-block; margin:0 12px 10px 0">
+          {{ field.label_tag }}
+          {{ field }}
+          {% for error in field.errors %}
+            <span class="errorlist">{{ error }}</span>
+          {% endfor %}
+        </span>
+      {% endfor %}
+
+      <button type="submit" class="button">Search</button>
+      <a href="{% url 'complaints:department_queue' %}">Clear</a>
+    </form>
+  </div>
+
   <table>
     <thead>
       <tr>

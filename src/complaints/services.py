@@ -2,7 +2,7 @@
 from datetime import timedelta
 
 from django.db import transaction
-from django.db.models import F
+from django.db.models import F, Q
 from django.utils import timezone
 
 from .models import (
@@ -395,6 +395,51 @@ def resolve_complaint(
         )
 
     return complaint
+
+
+def apply_complaint_filters(queryset, filters):
+    """Narrow a complaint queryset by the search criteria.
+
+    SCMS-F-028. This takes a queryset rather than building its own,
+    so it can only ever narrow what the caller already scoped by
+    role. Searching must not be a way around SCMS-SR-003: an agent
+    filtering by department cannot reach another department's work,
+    because the role scoping was applied before this runs.
+    """
+    reference_id = (filters.get("reference_id") or "").strip()
+    if reference_id:
+        queryset = queryset.filter(reference_id__icontains=reference_id)
+
+    status = filters.get("status")
+    if status:
+        queryset = queryset.filter(status=status)
+
+    category = filters.get("category")
+    if category:
+        queryset = queryset.filter(category=category)
+
+    department = filters.get("department")
+    if department:
+        queryset = queryset.filter(assigned_department=department)
+
+    lodged_from = filters.get("lodged_from")
+    if lodged_from:
+        queryset = queryset.filter(created_at__date__gte=lodged_from)
+
+    lodged_to = filters.get("lodged_to")
+    if lodged_to:
+        queryset = queryset.filter(created_at__date__lte=lodged_to)
+
+    keyword = (filters.get("q") or "").strip()
+    if keyword:
+        queryset = queryset.filter(
+            Q(title__icontains=keyword)
+            | Q(description__icontains=keyword)
+            | Q(location__icontains=keyword)
+            | Q(reference_id__icontains=keyword)
+        )
+
+    return queryset
 
 
 def add_comment(complaint, author, body, parent=None):

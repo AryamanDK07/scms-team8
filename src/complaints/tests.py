@@ -2204,6 +2204,173 @@ class MasterDataTests(BaseFixture):
             )
 
 
+class SearchTests(BaseFixture):
+    """SCMS-F-028 / TC-Rep-03: each filter, and combinations."""
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.estates = Department.objects.create(
+            name="Estates", code="estates",
+        )
+        self.facilities = Category.objects.create(
+            name="Facilities",
+            code="facilities",
+            department=self.estates,
+            sla_hours=72,
+        )
+
+        self.sys_admin = self.make_staff("root", Role.SYSTEM_ADMIN, None)
+        self.it_admin = self.make_staff(
+            "itadmin", Role.DEPARTMENT_ADMIN, self.department,
+        )
+
+        self.projector = self.make_complaint(
+            title="Projector not working",
+            description="The projector in room 302 does not switch on.",
+            location="Block C, Room 302",
+            assigned_department=self.department,
+            status=Complaint.Status.OPEN,
+        )
+        self.tap = self.make_complaint(
+            title="Leaking tap",
+            description="Water pooling under the basin all morning.",
+            location="Block A, Washroom",
+            category=self.facilities,
+            assigned_department=self.estates,
+            status=Complaint.Status.ASSIGNED,
+        )
+
+    def make_staff(self, username, role, department):
+        user = get_user_model().objects.create_user(
+            username=username, password="not-a-real-password",
+        )
+        profile = user.profile
+        profile.role = role
+        profile.department = department
+        profile.save()
+        return user
+
+    def search(self, user=None, **params):
+        self.client.force_login(user or self.sys_admin)
+        response = self.client.get("/queue/", params)
+        self.assertEqual(response.status_code, 200)
+        return response
+
+    def refs(self, response):
+        return {c.reference_id for c in response.context["complaints"]}
+
+    # --- each filter on its own ---------------------------------------
+
+    def test_no_filters_returns_everything_in_scope(self):
+        self.assertEqual(
+            self.refs(self.search()),
+            {self.projector.reference_id, self.tap.reference_id},
+        )
+
+    def test_filter_by_reference_id(self):
+        found = self.refs(
+            self.search(reference_id=self.projector.reference_id),
+        )
+        self.assertEqual(found, {self.projector.reference_id})
+
+    def test_filter_by_status(self):
+        found = self.refs(self.search(status=Complaint.Status.ASSIGNED))
+        self.assertEqual(found, {self.tap.reference_id})
+
+    def test_filter_by_category(self):
+        found = self.refs(self.search(category=self.facilities.pk))
+        self.assertEqual(found, {self.tap.reference_id})
+
+    def test_filter_by_department(self):
+        found = self.refs(self.search(department=self.estates.pk))
+        self.assertEqual(found, {self.tap.reference_id})
+
+    def test_keyword_matches_the_title(self):
+        found = self.refs(self.search(q="projector"))
+        self.assertEqual(found, {self.projector.reference_id})
+
+    def test_keyword_matches_the_description(self):
+        found = self.refs(self.search(q="pooling"))
+        self.assertEqual(found, {self.tap.reference_id})
+
+    def test_keyword_matches_the_location(self):
+        found = self.refs(self.search(q="Washroom"))
+        self.assertEqual(found, {self.tap.reference_id})
+
+    def test_keyword_is_case_insensitive(self):
+        self.assertEqual(
+            self.refs(self.search(q="PROJECTOR")),
+            {self.projector.reference_id},
+        )
+
+    def test_keyword_with_no_match_returns_nothing(self):
+        self.assertEqual(self.refs(self.search(q="helicopter")), set())
+
+    # --- date range ----------------------------------------------------
+
+    def test_date_range_includes_today(self):
+        today = timezone.localdate().isoformat()
+        found = self.refs(
+            self.search(lodged_from=today, lodged_to=today),
+        )
+        self.assertEqual(len(found), 2)
+
+    def test_date_range_before_today_excludes_everything(self):
+        past = (timezone.localdate() - timedelta(days=5)).isoformat()
+        self.assertEqual(
+            self.refs(self.search(lodged_from=past, lodged_to=past)),
+            set(),
+        )
+
+    def test_a_backwards_date_range_is_rejected(self):
+        """Swapping them silently would give right-looking results."""
+        today = timezone.localdate()
+        response = self.search(
+            lodged_from=today.isoformat(),
+            lodged_to=(today - timedelta(days=1)).isoformat(),
+        )
+        self.assertIn("lodged_to", response.context["search"].errors)
+
+    # --- combinations ---------------------------------------------------
+
+    def test_filters_combine_as_and_not_or(self):
+        found = self.refs(
+            self.search(
+                q="projector", status=Complaint.Status.ASSIGNED,
+            ),
+        )
+        self.assertEqual(found, set())
+
+    def test_a_matching_combination_returns_the_row(self):
+        found = self.refs(
+            self.search(q="tap", department=self.estates.pk),
+        )
+        self.assertEqual(found, {self.tap.reference_id})
+
+    # --- the rule that matters: search cannot widen scope ----------------
+
+    def test_department_admin_cannot_search_outside_their_department(self):
+        """SCMS-SR-003 must hold through the search, not around it."""
+        found = self.refs(
+            self.search(self.it_admin, department=self.estates.pk),
+        )
+        self.assertEqual(found, set())
+
+    def test_department_admin_search_still_finds_their_own(self):
+        found = self.refs(self.search(self.it_admin, q="projector"))
+        self.assertEqual(found, {self.projector.reference_id})
+
+    def test_keyword_cannot_surface_another_departments_complaint(self):
+        found = self.refs(self.search(self.it_admin, q="tap"))
+        self.assertEqual(found, set())
+
+    def test_complainant_cannot_reach_the_queue_at_all(self):
+        self.client.force_login(self.user)
+        self.assertEqual(self.client.get("/queue/").status_code, 403)
+
+
 class RoleFixture(BaseFixture):
     """Users across the four roles for authorisation tests."""
 

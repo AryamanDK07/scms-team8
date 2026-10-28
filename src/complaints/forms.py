@@ -8,6 +8,7 @@ from .models import (
     Category,
     Complaint,
     ComplaintComment,
+    Department,
     SubCategory,
 )
 from .services import (
@@ -143,6 +144,67 @@ class ResolutionForm(forms.Form):
             raise forms.ValidationError(str(rejection))
 
         return upload
+
+
+class ComplaintSearchForm(forms.Form):
+    """Search and filter the complaint queue (SCMS-F-028).
+
+    Every field is optional: an empty form means no narrowing, so
+    the queue still shows everything the viewer's role allows.
+    """
+
+    q = forms.CharField(
+        required=False,
+        label="Keyword",
+        widget=forms.TextInput(attrs={
+            "placeholder": "Title, description, location or reference",
+        }),
+    )
+    reference_id = forms.CharField(
+        required=False,
+        label="Reference ID",
+        widget=forms.TextInput(attrs={"placeholder": "SCMS-2026-000123"}),
+    )
+    status = forms.ChoiceField(
+        required=False,
+        choices=[("", "Any status")] + list(Complaint.Status.choices),
+    )
+    category = forms.ModelChoiceField(
+        required=False,
+        queryset=Category.objects.all(),
+        empty_label="Any category",
+    )
+    department = forms.ModelChoiceField(
+        required=False,
+        queryset=Department.objects.all(),
+        empty_label="Any department",
+    )
+    lodged_from = forms.DateField(
+        required=False,
+        label="Lodged from",
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+    lodged_to = forms.DateField(
+        required=False,
+        label="Lodged to",
+        widget=forms.DateInput(attrs={"type": "date"}),
+    )
+
+    def clean(self):
+        cleaned = super().clean()
+
+        start = cleaned.get("lodged_from")
+        end = cleaned.get("lodged_to")
+
+        if start and end and start > end:
+            # Silently swapping them would be worse: the results
+            # would look right and the dates would not.
+            self.add_error(
+                "lodged_to",
+                "The end of the range is before its start.",
+            )
+
+        return cleaned
 
 
 class CommentForm(forms.Form):
