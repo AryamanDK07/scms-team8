@@ -12,6 +12,7 @@ from .forms import (
     AttachmentForm,
     CommentForm,
     ComplaintForm,
+    ComplaintSearchForm,
     PriorityOverrideForm,
     ResolutionForm,
     StatusChangeForm,
@@ -27,6 +28,7 @@ from .roles import Role, STAFF_ROLES, get_department, get_role
 from .services import (
     add_comment,
     allowed_transitions,
+    apply_complaint_filters,
     assign_complaint,
     comment_thread,
     offerable_transitions,
@@ -524,11 +526,23 @@ def department_queue(request):
             assigned_department=get_department(request.user),
         )
 
+    # SCMS-F-028. The search runs on the queryset the role scoping
+    # has already narrowed, so filtering can only ever subtract.
+    # Building a fresh queryset here would make search a way around
+    # SCMS-SR-003.
+    search = ComplaintSearchForm(request.GET or None)
+
+    if search.is_valid():
+        complaints = apply_complaint_filters(
+            complaints, search.cleaned_data,
+        )
+
     return render(
         request,
         "complaints/department_queue.html",
         {
             "complaints": complaints.order_by("sla_due_at"),
+            "search": search,
             "role": role,
             "can_assign": role in (
                 Role.DEPARTMENT_ADMIN, Role.SYSTEM_ADMIN,
