@@ -83,7 +83,13 @@ def complaint_create(request):
                 complaint=complaint,
                 old_status="",
                 new_status=complaint.status,
+                field_name="status",
+                old_value="",
+                new_value=complaint.get_status_display(),
                 changed_by=request.user,
+                # SCMS-F-027: lodging is a state change too, and was
+                # the one path that recorded no source IP.
+                source_ip=request.META.get("REMOTE_ADDR"),
                 comment=(
                     f"Complaint submitted and assigned to "
                     f"{department.name}."

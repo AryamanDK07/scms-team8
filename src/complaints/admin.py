@@ -191,7 +191,11 @@ class ComplaintAdmin(admin.ModelAdmin):
                 complaint=obj,
                 old_status=old_status or "",
                 new_status=obj.status,
+                field_name="status",
+                old_value=old_label if old_status else "",
+                new_value=new_label,
                 changed_by=request.user,
+                source_ip=request.META.get("REMOTE_ADDR"),
                 comment=comment,
             )
 

@@ -2371,6 +2371,255 @@ class SearchTests(BaseFixture):
         self.assertEqual(self.client.get("/queue/").status_code, 403)
 
 
+class AuditTrailCompletenessTests(BaseFixture):
+    """SCMS-F-027 / TC-Audit-01: every change, fully attributed.
+
+    AuditTrailTests above proves rows cannot be edited or deleted.
+    This proves every flow actually writes one, and that it carries
+    the actor, the source IP and the before and after values the
+    requirement names.
+    """
+
+    JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
+    REMARKS = (
+        "Replaced the failed projector lamp module and confirmed "
+        "the unit powers on and displays correctly."
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._media_root = tempfile.mkdtemp()
+        cls._media_override = override_settings(MEDIA_ROOT=cls._media_root)
+        cls._media_override.enable()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._media_override.disable()
+        shutil.rmtree(cls._media_root, ignore_errors=True)
+        super().tearDownClass()
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.sub_category = SubCategory.objects.create(
+            name="Projector", code="projector", category=self.category,
+        )
+
+        profile = self.user.profile
+        profile.role = Role.COMPLAINANT
+        profile.save()
+
+        self.agent = self.make_staff(
+            "agent", Role.SUPPORT_AGENT, self.department,
+        )
+        self.other_agent = self.make_staff(
+            "agent2", Role.SUPPORT_AGENT, self.department,
+        )
+        self.admin = self.make_staff(
+            "itadmin", Role.DEPARTMENT_ADMIN, self.department,
+        )
+
+    def make_staff(self, username, role, department):
+        user = get_user_model().objects.create_user(
+            username=username, password="not-a-real-password",
+        )
+        profile = user.profile
+        profile.role = role
+        profile.department = department
+        profile.save()
+        return user
+
+    def lodge(self):
+        self.client.force_login(self.user)
+        response = self.client.post("/new/", {
+            "title": "Projector not working",
+            "category": self.category.pk,
+            "sub_category": self.sub_category.pk,
+            "location": "Block C, Room 302",
+            "description": "The projector in room 302 does not switch on.",
+        })
+        self.assertEqual(response.status_code, 302)
+        self.client.logout()
+        return Complaint.objects.latest("created_at")
+
+    def assert_complete(self, entry, field, old, new):
+        """Every part SCMS-F-027 names must be present."""
+        self.assertEqual(entry.field_name, field)
+        self.assertEqual(entry.old_value, old)
+        self.assertEqual(entry.new_value, new)
+        self.assertIsNotNone(entry.changed_by, "no actor recorded")
+        self.assertIsNotNone(entry.created_at, "no timestamp")
+        self.assertIsNotNone(entry.source_ip, "no source IP recorded")
+
+    # --- every flow writes a row ----------------------------------------
+
+    def test_lodging_is_audited(self):
+        """This was the one path recording no source IP at all."""
+        complaint = self.lodge()
+        entry = complaint.status_history.get()
+
+        self.assert_complete(entry, "status", "", "Open")
+        self.assertEqual(entry.changed_by, self.user)
+
+    def test_assignment_records_the_owner_change(self):
+        complaint = self.lodge()
+
+        self.client.force_login(self.admin)
+        self.client.post(
+            f"/{complaint.reference_id}/assign/",
+            {"agent": self.agent.pk, "reason": ""},
+        )
+
+        entry = complaint.status_history.first()
+        self.assert_complete(entry, "assigned_to", "", "agent")
+
+    def test_reassignment_records_both_owners(self):
+        complaint = self.lodge()
+        assign_complaint(complaint, self.agent, actor=self.admin)
+
+        self.client.force_login(self.admin)
+        self.client.post(
+            f"/{complaint.reference_id}/assign/",
+            {"agent": self.other_agent.pk, "reason": "On leave"},
+        )
+
+        entry = complaint.status_history.first()
+        self.assert_complete(entry, "assigned_to", "agent", "agent2")
+
+    def test_priority_override_records_both_values(self):
+        complaint = self.lodge()
+
+        self.client.force_login(self.admin)
+        self.client.post(
+            f"/{complaint.reference_id}/priority/",
+            {
+                "priority": Complaint.Priority.CRITICAL,
+                "reason": "Affects an entire floor",
+            },
+        )
+
+        entry = complaint.status_history.first()
+        self.assert_complete(entry, "priority", "High", "Critical")
+
+    def test_status_change_records_both_statuses(self):
+        complaint = self.lodge()
+        assign_complaint(complaint, self.agent, actor=self.admin)
+
+        self.client.force_login(self.agent)
+        self.client.post(
+            f"/{complaint.reference_id}/status/",
+            {"status": Complaint.Status.IN_PROGRESS, "comment": ""},
+        )
+
+        entry = complaint.status_history.first()
+        self.assert_complete(entry, "status", "Assigned", "In Progress")
+
+    def test_resolution_records_the_status_move(self):
+        complaint = self.lodge()
+        assign_complaint(complaint, self.agent, actor=self.admin)
+        transition_status(
+            complaint, Complaint.Status.IN_PROGRESS, actor=self.agent,
+        )
+
+        self.client.force_login(self.agent)
+        self.client.post(
+            f"/{complaint.reference_id}/resolve/",
+            {
+                "remarks": self.REMARKS,
+                "proof": SimpleUploadedFile(
+                    "fixed.jpg", self.JPEG, "image/jpeg",
+                ),
+            },
+        )
+
+        entry = complaint.status_history.first()
+        self.assert_complete(entry, "status", "In Progress", "Resolved")
+
+    # --- the trail as a whole --------------------------------------------
+
+    def test_a_full_lifecycle_leaves_an_unbroken_trail(self):
+        complaint = self.lodge()
+
+        self.client.force_login(self.admin)
+        self.client.post(
+            f"/{complaint.reference_id}/assign/",
+            {"agent": self.agent.pk, "reason": ""},
+        )
+        self.client.post(
+            f"/{complaint.reference_id}/priority/",
+            {
+                "priority": Complaint.Priority.CRITICAL,
+                "reason": "Affects an entire floor",
+            },
+        )
+
+        self.client.force_login(self.agent)
+        self.client.post(
+            f"/{complaint.reference_id}/status/",
+            {"status": Complaint.Status.IN_PROGRESS, "comment": ""},
+        )
+        self.client.post(
+            f"/{complaint.reference_id}/resolve/",
+            {
+                "remarks": self.REMARKS,
+                "proof": SimpleUploadedFile(
+                    "fixed.jpg", self.JPEG, "image/jpeg",
+                ),
+            },
+        )
+
+        entries = list(complaint.status_history.order_by("created_at"))
+
+        self.assertEqual(
+            [e.field_name for e in entries],
+            ["status", "assigned_to", "priority", "status", "status"],
+        )
+
+        for entry in entries:
+            self.assertIsNotNone(entry.changed_by)
+            self.assertIsNotNone(entry.source_ip)
+
+    def test_no_flow_writes_a_row_without_an_actor(self):
+        complaint = self.lodge()
+        assign_complaint(complaint, self.agent, actor=self.admin)
+
+        self.assertFalse(
+            complaint.status_history.filter(changed_by__isnull=True)
+            .exists()
+        )
+
+    # --- append-only, across the new flows --------------------------------
+
+    def test_an_audited_row_cannot_be_edited_afterwards(self):
+        complaint = self.lodge()
+        entry = complaint.status_history.get()
+
+        entry.new_value = "Tampered"
+
+        with self.assertRaises(ValueError):
+            entry.save()
+
+    def test_an_audited_row_cannot_be_deleted(self):
+        complaint = self.lodge()
+
+        with self.assertRaises(ValueError):
+            complaint.status_history.get().delete()
+
+    def test_the_trail_survives_a_queryset_delete_attempt(self):
+        """A bulk delete bypasses Model.delete, so check the count."""
+        complaint = self.lodge()
+        before = complaint.status_history.count()
+
+        try:
+            complaint.status_history.all().delete()
+        except Exception:
+            pass
+
+        self.assertEqual(complaint.status_history.count(), before)
+
+
 class RoleFixture(BaseFixture):
     """Users across the four roles for authorisation tests."""
 

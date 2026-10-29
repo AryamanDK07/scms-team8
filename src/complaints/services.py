@@ -91,14 +91,16 @@ def override_priority(
         complaint.priority = priority
         complaint.save(update_fields=["priority", "updated_at"])
 
-        # The audit table is shaped around status transitions, so a
-        # priority change carries the same status on both sides and
-        # states the before/after values in the comment. Generalising
-        # the audit row to arbitrary field changes belongs to T8-34.
         ComplaintStatusHistory.objects.create(
             complaint=complaint,
+            # The status is unchanged by a priority override; the
+            # change itself is carried by the field_name/old_value/
+            # new_value triple (SCMS-F-027).
             old_status=complaint.status,
             new_status=complaint.status,
+            field_name="priority",
+            old_value=labels.get(old_priority, old_priority),
+            new_value=labels.get(priority, priority),
             changed_by=actor,
             source_ip=source_ip,
             comment=(
@@ -217,6 +219,9 @@ def transition_status(
             complaint=complaint,
             old_status=old_status,
             new_status=new_status,
+            field_name="status",
+            old_value=labels.get(old_status, old_status),
+            new_value=labels.get(new_status, new_status),
             changed_by=actor,
             source_ip=source_ip,
             comment=detail,
@@ -294,6 +299,11 @@ def assign_complaint(complaint, agent, actor, reason="", source_ip=None):
             complaint=complaint,
             old_status=old_status,
             new_status=complaint.status,
+            field_name="assigned_to",
+            old_value=(
+                previous.get_username() if previous else ""
+            ),
+            new_value=agent.get_username(),
             changed_by=actor,
             source_ip=source_ip,
             comment=detail,
@@ -385,10 +395,15 @@ def resolve_complaint(
             "status", "resolution_remarks", "resolved_at", "updated_at",
         ])
 
+        status_labels = dict(Complaint.Status.choices)
+
         ComplaintStatusHistory.objects.create(
             complaint=complaint,
             old_status=old_status,
             new_status=Complaint.Status.RESOLVED,
+            field_name="status",
+            old_value=status_labels.get(old_status, old_status),
+            new_value=status_labels[Complaint.Status.RESOLVED],
             changed_by=actor,
             source_ip=source_ip,
             comment=f"Resolved. {text}",
