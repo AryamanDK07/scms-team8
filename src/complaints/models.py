@@ -243,12 +243,41 @@ class Complaint(models.Model):
         super().save(*args, **kwargs)
 
 
+class AppendOnlyQuerySet(models.QuerySet):
+    """Refuses the bulk operations that bypass Model.save/delete.
+
+    Overriding save() and delete() on the model alone is not enough
+    for SCMS-SR-006: QuerySet.delete() and QuerySet.update() go
+    straight to SQL without calling either, so a single
+    .all().delete() would erase the audit trail while the model
+    looked protected. These refuse at the queryset level too.
+
+    This is application-level enforcement. The database-level half
+    of SCMS-SR-006 -- withholding UPDATE and DELETE from the
+    application's database role -- is deployment configuration and
+    is tracked separately in T8-48.
+    """
+
+    APPEND_ONLY = (
+        "Audit rows are append-only and cannot be {} "
+        "(SCMS-SR-006)."
+    )
+
+    def delete(self):
+        raise ValueError(self.APPEND_ONLY.format("deleted"))
+
+    def update(self, **kwargs):
+        raise ValueError(self.APPEND_ONLY.format("modified"))
+
+
 class ComplaintStatusHistory(models.Model):
     """Append-only audit trail of complaint state changes.
 
     SCMS-F-027 and SCMS-SR-006: rows are written once and never
     updated or deleted through the application.
     """
+
+    objects = AppendOnlyQuerySet.as_manager()
 
     complaint = models.ForeignKey(
         Complaint,
@@ -271,6 +300,20 @@ class ComplaintStatusHistory(models.Model):
         blank=True,
         related_name="complaint_status_changes",
     )
+    # SCMS-F-027 asks for before and after values on every change,
+    # not only on status moves. old_status/new_status stay as they
+    # are, since the tracking page reads them; these three carry the
+    # same information for a change to any other field, so a
+    # priority or ownership change is a first-class audit row rather
+    # than a sentence in the comment.
+    field_name = models.CharField(
+        max_length=40,
+        default="status",
+        help_text="The field this row records a change to.",
+    )
+    old_value = models.TextField(blank=True)
+    new_value = models.TextField(blank=True)
+
     source_ip = models.GenericIPAddressField(null=True, blank=True)
     comment = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
