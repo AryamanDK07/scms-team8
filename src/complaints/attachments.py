@@ -13,6 +13,9 @@ to be.
 
 from pathlib import Path
 
+from django.conf import settings
+from django.utils.module_loading import import_string
+
 #: Maximum size of a single attachment.
 MAX_BYTES = 5 * 1024 * 1024
 
@@ -39,6 +42,55 @@ ALLOWED_LABELS = "JPG, PNG or PDF"
 
 class AttachmentRejected(Exception):
     """Raised with a message meant to be shown to the complainant."""
+
+
+def get_scanner():
+    """Return the configured malware scanner, or None.
+
+    SCMS-SR-005 requires uploads to be scanned for malware. A
+    scanner is an external service -- ClamAV or similar -- and none
+    is available to this project, so ATTACHMENT_MALWARE_SCANNER is
+    empty by default and no scanning happens.
+
+    That is stated plainly rather than papered over. A function
+    here that always returned "clean" would make the requirement
+    look met while giving no protection at all, which is worse than
+    the gap, because it would stop anyone looking again.
+
+    What is built and tested is the integration point: set
+    ATTACHMENT_MALWARE_SCANNER to the dotted path of a callable
+    taking the upload and returning a truthy verdict for an
+    infected file, and every upload goes through it before being
+    stored.
+    """
+    path = getattr(settings, "ATTACHMENT_MALWARE_SCANNER", "")
+
+    return import_string(path) if path else None
+
+
+def scan_upload(upload):
+    """Reject the upload if the configured scanner flags it.
+
+    Does nothing when no scanner is configured, which is the
+    default. The file position is restored afterwards so the
+    scanner cannot leave the upload half-read for whoever stores
+    it next.
+    """
+    scanner = get_scanner()
+
+    if scanner is None:
+        return
+
+    try:
+        verdict = scanner(upload)
+    finally:
+        upload.seek(0)
+
+    if verdict:
+        raise AttachmentRejected(
+            f"\"{upload.name}\" was rejected by the malware scanner "
+            f"({verdict}). It has not been stored."
+        )
 
 
 def detect_format(upload):
@@ -109,5 +161,11 @@ def validate_upload(upload, existing_count=0):
             f"extension \"{suffix}\". Rename it to match its "
             f"contents and try again."
         )
+
+    # Last, so the scanner is spared the files already refused on
+    # size, emptiness or format -- and so a rejection message names
+    # the simplest reason the upload failed rather than the most
+    # alarming one.
+    scan_upload(upload)
 
     return label

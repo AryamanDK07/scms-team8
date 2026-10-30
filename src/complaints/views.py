@@ -294,12 +294,21 @@ def complaint_attachment_download(request, reference_id, pk):
         complaint.attachments, pk=pk,
     )
 
-    return FileResponse(
+    response = FileResponse(
         attachment.file.open("rb"),
         as_attachment=True,
         filename=attachment.original_name,
         content_type=attachment.content_type,
     )
+
+    # as_attachment already sets Content-Disposition: attachment, so
+    # the browser offers the file rather than rendering it. nosniff
+    # covers the other half: without it a browser may ignore the
+    # declared type and act on what the bytes look like, which is
+    # precisely the guess SCMS-SR-005 exists to prevent.
+    response["X-Content-Type-Options"] = "nosniff"
+
+    return response
 
 
 @role_required(Role.DEPARTMENT_ADMIN, Role.SYSTEM_ADMIN)

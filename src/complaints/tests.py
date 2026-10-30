@@ -3,6 +3,7 @@ import re
 import shutil
 import tempfile
 from datetime import datetime, timedelta
+from pathlib import Path
 from unittest import skipUnless
 from unittest.mock import patch
 
@@ -47,6 +48,28 @@ from .services import (
     resolve_complaint,
     transition_status,
 )
+
+
+#: Names the stub scanners below were handed, for SCMS-SR-005 tests.
+#: They live at module level because the scanner is configured by
+#: dotted path, which import_string has to be able to resolve.
+_SCANNER_CALLS = []
+
+
+def _scanner_that_records(upload):
+    _SCANNER_CALLS.append(upload.name)
+
+    return None
+
+
+def _scanner_that_flags(upload):
+    return "EICAR-Test-Signature"
+
+
+def _scanner_that_reads_everything(upload):
+    upload.read()
+
+    return None
 
 
 class BaseFixture(TestCase):
@@ -3229,6 +3252,244 @@ class ObjectLevelAccessTests(RoleFixture):
         orphan.profile.delete()
         orphan.refresh_from_db()
         self.assertFalse(can_view_complaint(orphan, self.complaint))
+
+
+class SecureEvidenceStorageTests(BaseFixture):
+    """SCMS-SR-005 / TC-Sec-05: how evidence is stored and served.
+
+    Most of this was built in T8-15 and never asserted as security
+    behaviour. The acceptance criterion names two checks -- an
+    uploaded .php file is rejected, and a stored file cannot be
+    executed through a direct URL -- and both are here, alongside
+    the storage rules the requirement lists.
+
+    One clause of SCMS-SR-005 is NOT met: uploads are not scanned
+    for malware, because no scanner is available to this project.
+    test_no_malware_scanner_is_configured_by_default asserts that
+    plainly, so the gap stays visible instead of being discovered
+    by whoever trusts the requirement later.
+    """
+
+    JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
+    PHP = b"<?php system($_GET['c']); ?>"
+    EXE = b"MZ\x90\x00" + b"\x00" * 64
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls._media_root = tempfile.mkdtemp()
+        cls._media_override = override_settings(MEDIA_ROOT=cls._media_root)
+        cls._media_override.enable()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._media_override.disable()
+        shutil.rmtree(cls._media_root, ignore_errors=True)
+        super().tearDownClass()
+
+    def setUp(self):
+        super().setUp()
+        self.complaint = self.make_complaint(
+            assigned_department=self.department,
+        )
+        self.client.force_login(self.user)
+
+    def upload(self, name, content):
+        return SimpleUploadedFile(name, content)
+
+    def post_attachment(self, name, content):
+        return self.client.post(
+            f"/{self.complaint.reference_id}/attach/",
+            {"file": self.upload(name, content)},
+        )
+
+    def stored_attachment(self):
+        """Store a valid attachment and return it."""
+        self.post_attachment("evidence.jpg", self.JPEG)
+
+        return self.complaint.attachments.get()
+
+    # --- the two acceptance checks ---------------------------------
+
+    def test_a_php_file_is_rejected(self):
+        from .attachments import AttachmentRejected, validate_upload
+
+        with self.assertRaises(AttachmentRejected) as caught:
+            validate_upload(self.upload("shell.php", self.PHP))
+
+        self.assertIn("not a JPG, PNG or PDF", str(caught.exception))
+        self.assertEqual(self.complaint.attachments.count(), 0)
+
+    def test_php_disguised_as_an_image_is_rejected(self):
+        """Renaming it is the obvious next thing an attacker tries."""
+        from .attachments import AttachmentRejected, validate_upload
+
+        with self.assertRaises(AttachmentRejected):
+            validate_upload(self.upload("shell.jpg", self.PHP))
+
+    def test_an_image_renamed_to_php_is_rejected(self):
+        """Real JPEG bytes must not buy a .php name on disk."""
+        from .attachments import AttachmentRejected, validate_upload
+
+        with self.assertRaises(AttachmentRejected) as caught:
+            validate_upload(self.upload("payload.php", self.JPEG))
+
+        self.assertIn("extension", str(caught.exception))
+
+    def test_an_executable_is_rejected(self):
+        from .attachments import AttachmentRejected, validate_upload
+
+        with self.assertRaises(AttachmentRejected):
+            validate_upload(self.upload("virus.jpg", self.EXE))
+
+    def test_a_stored_file_is_not_reachable_by_url(self):
+        """The second acceptance check, from both directions."""
+        from django.urls import get_resolver
+        from django.views.static import serve
+
+        attachment = self.stored_attachment()
+
+        # The guarantee is not that MEDIA_URL is unset -- Django 5.2
+        # defaults it to "/" whether or not anything serves it. It is
+        # that no route hands out files from MEDIA_ROOT, so a stored
+        # file has no URL to request at all.
+        serving = [
+            pattern
+            for pattern in get_resolver().url_patterns
+            if getattr(pattern, "callback", None) is serve
+        ]
+
+        self.assertEqual(
+            serving, [], "a route serves files straight from disk",
+        )
+
+        for candidate in (
+            f"/media/{attachment.file.name}",
+            f"/{attachment.file.name}",
+        ):
+            with self.subTest(url=candidate):
+                self.assertEqual(
+                    self.client.get(candidate).status_code, 404,
+                )
+
+    # --- the storage rules the requirement lists -------------------
+
+    def test_the_stored_name_is_random_not_the_uploaded_one(self):
+        attachment = self.stored_attachment()
+        stored = Path(attachment.file.name).stem
+
+        self.assertNotIn("evidence", attachment.file.name)
+        self.assertEqual(len(stored), 32, "not a uuid4 hex name")
+        self.assertEqual(attachment.original_name, "evidence.jpg")
+
+    def test_uploads_are_stored_outside_the_source_tree(self):
+        attachment = self.stored_attachment()
+        stored = Path(settings.MEDIA_ROOT) / attachment.file.name
+
+        self.assertTrue(stored.exists())
+        self.assertNotIn(
+            "complaints/templates", str(stored),
+            "an upload landed somewhere it could be served from",
+        )
+
+    def test_the_declared_type_is_the_detected_one(self):
+        """Not the one the client sent, which it chooses freely."""
+        response = self.client.post(
+            f"/{self.complaint.reference_id}/attach/",
+            {"file": SimpleUploadedFile(
+                "evidence.jpg", self.JPEG, content_type="text/html",
+            )},
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(
+            self.complaint.attachments.get().content_type, "image/jpeg",
+        )
+
+    # --- how it is served ------------------------------------------
+
+    def test_download_is_served_as_an_attachment(self):
+        attachment = self.stored_attachment()
+
+        response = self.client.get(
+            f"/{self.complaint.reference_id}/attachments/"
+            f"{attachment.pk}/",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            "attachment", response["Content-Disposition"],
+        )
+
+    def test_download_forbids_content_type_sniffing(self):
+        attachment = self.stored_attachment()
+
+        response = self.client.get(
+            f"/{self.complaint.reference_id}/attachments/"
+            f"{attachment.pk}/",
+        )
+
+        self.assertEqual(
+            response["X-Content-Type-Options"], "nosniff",
+        )
+
+    # --- the malware clause ----------------------------------------
+
+    def test_no_malware_scanner_is_configured_by_default(self):
+        """SCMS-SR-005 is not fully met, and says so here.
+
+        A scanner is an external service and none is available to
+        this project. Asserting the gap keeps it visible: if someone
+        later wires one up, this test fails and asks them to say so.
+        """
+        from .attachments import get_scanner
+
+        self.assertIsNone(
+            get_scanner(),
+            "a scanner is configured; update SCMS-SR-005's status",
+        )
+
+    def test_a_configured_scanner_sees_every_upload(self):
+        from .attachments import validate_upload
+
+        with override_settings(
+            ATTACHMENT_MALWARE_SCANNER=(
+                "complaints.tests._scanner_that_records"
+            ),
+        ):
+            _SCANNER_CALLS.clear()
+            validate_upload(self.upload("evidence.jpg", self.JPEG))
+
+        self.assertEqual(_SCANNER_CALLS, ["evidence.jpg"])
+
+    def test_a_flagged_upload_is_refused(self):
+        from .attachments import AttachmentRejected, validate_upload
+
+        with override_settings(
+            ATTACHMENT_MALWARE_SCANNER=(
+                "complaints.tests._scanner_that_flags"
+            ),
+        ):
+            with self.assertRaises(AttachmentRejected) as caught:
+                validate_upload(self.upload("evidence.jpg", self.JPEG))
+
+        self.assertIn("malware scanner", str(caught.exception))
+        self.assertIn("not been stored", str(caught.exception))
+
+    def test_the_scanner_does_not_consume_the_upload(self):
+        """A scanner that reads the file must not leave it empty."""
+        from .attachments import validate_upload
+
+        upload = self.upload("evidence.jpg", self.JPEG)
+
+        with override_settings(
+            ATTACHMENT_MALWARE_SCANNER=(
+                "complaints.tests._scanner_that_reads_everything"
+            ),
+        ):
+            validate_upload(upload)
+
+        self.assertEqual(upload.read(), self.JPEG)
 
 
 class UrlTamperingSweepTests(RoleFixture):
