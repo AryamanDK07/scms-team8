@@ -5,3 +5,9 @@ __pycache__/
 *.sqlite3
 # Uploaded evidence (SCMS-F-008) is never committed.
 private-media/
+
+# CI working files (test and coverage output captured for the run summary)
+test-output.txt
+coverage-output.txt
+.coverage
+htmlcov/
