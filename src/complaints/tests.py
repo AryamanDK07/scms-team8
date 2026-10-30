@@ -3231,6 +3231,163 @@ class ObjectLevelAccessTests(RoleFixture):
         self.assertFalse(can_view_complaint(orphan, self.complaint))
 
 
+class UrlTamperingSweepTests(RoleFixture):
+    """SCMS-SR-003 / TC-Sec-03 across every complaint-scoped route.
+
+    The acceptance criterion is one sentence -- changing the
+    complaint ID in the URL to another user's complaint returns 403
+    -- and it was previously demonstrated on the detail view alone.
+    One route passing says nothing about the other seven, and an
+    authorisation hole only needs one.
+
+    So every route carrying a reference_id is swept, and
+    test_every_complaint_route_is_swept fails if a new one is added
+    without being listed here. That is the part that keeps working
+    after this sprint: a route added later with no object-level
+    check cannot pass CI quietly.
+    """
+
+    #: name -> (HTTP method, POST data)
+    ROUTES = {
+        "complaint_detail": ("get", None),
+        "complaint_comment_add": ("post", {"body": "Any comment."}),
+        "complaint_attachment_add": ("post", {}),
+        "complaint_attachment_download": ("get", None),
+        "complaint_assign": ("post", {"assigned_to": "1"}),
+        "complaint_priority": ("post", {"priority": "HIGH",
+                                        "reason": "Any reason at all."}),
+        "complaint_status": ("post", {"status": "IN_PROGRESS"}),
+        "complaint_resolve": ("post", {"remarks": "x" * 60}),
+    }
+
+    def path_for(self, name):
+        reference = self.complaint.reference_id
+
+        if name == "complaint_attachment_download":
+            return f"/{reference}/attachments/1/"
+
+        suffix = {
+            "complaint_detail": "",
+            "complaint_comment_add": "comment/",
+            "complaint_attachment_add": "attach/",
+            "complaint_assign": "assign/",
+            "complaint_priority": "priority/",
+            "complaint_status": "status/",
+            "complaint_resolve": "resolve/",
+        }[name]
+
+        return f"/{reference}/{suffix}"
+
+    def request(self, name):
+        method, data = self.ROUTES[name]
+        send = getattr(self.client, method)
+
+        return send(self.path_for(name), data) if data else send(
+            self.path_for(name),
+        )
+
+    def assert_all_denied(self, user, who):
+        for name in self.ROUTES:
+            with self.subTest(route=name, user=who):
+                self.client.force_login(user)
+                response = self.request(name)
+                self.assertEqual(
+                    response.status_code,
+                    403,
+                    f"{who} reached {name} with status "
+                    f"{response.status_code}",
+                )
+                self.client.logout()
+
+    def test_every_complaint_route_is_swept(self):
+        """Fails when a new complaint route is added unswept.
+
+        Without this, the sweep below silently stops being a sweep
+        the first time someone adds a route.
+        """
+        from . import urls
+
+        routed = {
+            pattern.name
+            for pattern in urls.urlpatterns
+            if "reference_id" in str(pattern.pattern)
+        }
+
+        # Without this, a discovery that found nothing would make
+        # the comparison below trivially true and the sweep hollow.
+        self.assertGreaterEqual(
+            len(routed), 8, "route discovery found almost nothing",
+        )
+
+        self.assertEqual(
+            routed - set(self.ROUTES),
+            set(),
+            "a complaint route is not covered by the tampering sweep",
+        )
+
+    def test_the_right_department_admin_is_allowed_through(self):
+        """The positive control for the denial tests above.
+
+        If the staff routes were broken or unreachable for everyone,
+        every denial test would pass while proving nothing about
+        authorisation. This asserts the same routes do work for the
+        Department Admin who owns the complaint, so the denials are
+        about the object and not about the route.
+        """
+        self.client.force_login(self.dept_admin)
+
+        for name in ("complaint_detail", "complaint_assign",
+                     "complaint_priority"):
+            with self.subTest(route=name):
+                response = self.client.get(self.path_for(name))
+                self.assertEqual(
+                    response.status_code,
+                    200,
+                    f"{name} refused the admin who should have access",
+                )
+
+    def test_a_stranger_is_denied_every_route(self):
+        """Another complainant, who owns nothing here."""
+        self.assert_all_denied(self.other_complainant, "other complainant")
+
+    def test_an_agent_from_another_department_is_denied_every_route(self):
+        self.assert_all_denied(self.other_agent, "agent, wrong department")
+
+    def test_an_admin_of_another_department_is_denied_every_route(self):
+        """The sharpest case: the role is right, the object is not.
+
+        A Department Admin passes every role check on the staff
+        routes, so only the object-level check stands between them
+        and another department's complaint.
+        """
+        self.assert_all_denied(
+            self.other_dept_admin, "department admin, wrong department",
+        )
+
+    def test_anonymous_is_sent_to_login_not_shown_a_403(self):
+        """Deny-by-default must still be usable when logged out."""
+        for name in self.ROUTES:
+            with self.subTest(route=name):
+                response = self.request(name)
+                self.assertEqual(response.status_code, 302)
+                self.assertIn("/accounts/login/", response["Location"])
+
+    def test_the_owner_cannot_use_the_staff_routes(self):
+        """Reading your own complaint is not working on it."""
+        staff_only = (
+            "complaint_assign",
+            "complaint_priority",
+            "complaint_status",
+            "complaint_resolve",
+        )
+
+        for name in staff_only:
+            with self.subTest(route=name):
+                self.client.force_login(self.user)
+                self.assertEqual(self.request(name).status_code, 403)
+                self.client.logout()
+
+
 class ViewAccessTests(RoleFixture):
     """The URL-tampering case from TC-Sec-03, through the view."""
 
