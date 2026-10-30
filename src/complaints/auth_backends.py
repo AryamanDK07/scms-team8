@@ -13,6 +13,8 @@ can never be authenticated into another user's account.
 from django.contrib.auth import get_user_model
 from django.contrib.auth.backends import ModelBackend
 
+from . import security
+
 
 class EmailBackend(ModelBackend):
     """Authenticate on e-mail address and password.
@@ -42,10 +44,27 @@ class EmailBackend(ModelBackend):
             return None
 
         user = matches[0]
+        source_ip = request.META.get("REMOTE_ADDR") if request else None
+
+        # Brute-force lockout (SCMS-F-005). Checked before the
+        # password so that attempts made during a lock neither
+        # succeed with the right password nor extend the lock with
+        # the wrong one; the lock runs for a fixed fifteen minutes
+        # from the failure that caused it.
+        if security.is_locked(user):
+            security.register_blocked_attempt(user, email, source_ip)
+            return None
 
         # user_can_authenticate() rejects inactive accounts, which is
         # what makes deactivation in SCMS-F-024 take effect at login.
-        if user.check_password(password) and self.user_can_authenticate(user):
+        if user.check_password(password):
+            if not self.user_can_authenticate(user):
+                return None
+
+            security.register_successful_login(user)
+
             return user
+
+        security.register_failed_login(user, email, source_ip)
 
         return None

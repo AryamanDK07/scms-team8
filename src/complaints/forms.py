@@ -2,6 +2,7 @@ from django import forms
 from django.contrib.auth import get_user_model
 from django.contrib.auth.forms import AuthenticationForm
 
+from . import security
 from .attachments import AttachmentRejected, validate_upload
 from .models import (
     AttachmentKind,
@@ -41,7 +42,46 @@ class EmailLoginForm(AuthenticationForm):
             "The e-mail address or password is incorrect. "
             "Please try again."
         ),
+        "account_locked": (
+            "This account is locked after too many failed sign-in "
+            "attempts. Try again in %(minutes)s minute%(plural)s, or "
+            "reset your password."
+        ),
     }
+
+    def clean(self):
+        """Replace the generic refusal with the lockout message.
+
+        SCMS-F-005 requires the blocked attempt to say why, and
+        "incorrect password" would be actively misleading to someone
+        who has since remembered the right one.
+
+        The lock is checked after super().clean() rather than before
+        it, so the attempt still reaches EmailBackend and is recorded
+        there. Short-circuiting here would leave attempts made during
+        a lock out of the audit trail, which is the part that shows
+        whether someone kept trying.
+        """
+        try:
+            return super().clean()
+        except forms.ValidationError:
+            user = security.find_user_by_email(
+                self.cleaned_data.get("username"),
+            )
+
+            if user is None or not security.is_locked(user):
+                raise
+
+            minutes = security.lockout_minutes_remaining(user)
+
+            raise forms.ValidationError(
+                self.error_messages["account_locked"],
+                code="account_locked",
+                params={
+                    "minutes": minutes,
+                    "plural": "" if minutes == 1 else "s",
+                },
+            )
 
 
 class PriorityOverrideForm(forms.Form):

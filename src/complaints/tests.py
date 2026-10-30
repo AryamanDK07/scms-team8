@@ -24,8 +24,12 @@ from .models import (
     ComplaintComment,
     ComplaintStatusHistory,
     Department,
+    SecurityEvent,
+    SecurityEventType,
     SubCategory,
+    UserProfile,
 )
+from .security import LOCKOUT_THRESHOLD
 from .services import (
     STATUS_TRANSITIONS,
     add_comment,
@@ -2777,6 +2781,193 @@ class PasswordHashingTests(TestCase):
         )
 
         self.assertEqual(self.stored_hash(), legacy)
+
+
+class AccountLockoutTests(TestCase):
+    """SCMS-F-005 / TC-Auth-05: lock after 5 consecutive failures."""
+
+    LOGIN_URL = "/accounts/login/"
+    PASSWORD = "not-a-real-password"
+
+    def setUp(self):
+        self.User = get_user_model()
+        self.user = self.User.objects.create_user(
+            username="asha",
+            email="asha@example.com",
+            password=self.PASSWORD,
+        )
+        self.other = self.User.objects.create_user(
+            username="bala",
+            email="bala@example.com",
+            password=self.PASSWORD,
+        )
+
+    def attempt(self, password, email="asha@example.com"):
+        return self.client.post(
+            self.LOGIN_URL, {"username": email, "password": password},
+        )
+
+    def fail_times(self, count, email="asha@example.com"):
+        for _ in range(count):
+            self.attempt("wrong-password", email=email)
+
+    def profile(self, user=None):
+        return UserProfile.objects.get(user=user or self.user)
+
+    def logged_in(self):
+        return self.client.session.get("_auth_user_id")
+
+    def test_five_failures_lock_the_account(self):
+        self.fail_times(LOCKOUT_THRESHOLD)
+
+        self.assertIsNotNone(self.profile().locked_until)
+
+    def test_four_failures_do_not_lock(self):
+        """The threshold is 5, so 4 must still leave the door open."""
+        self.fail_times(LOCKOUT_THRESHOLD - 1)
+
+        self.assertIsNone(self.profile().locked_until)
+
+        self.attempt(self.PASSWORD)
+
+        self.assertEqual(self.logged_in(), str(self.user.pk))
+
+    def test_correct_password_is_refused_while_locked(self):
+        """The point of the lock: knowing the password is not enough."""
+        self.fail_times(LOCKOUT_THRESHOLD)
+
+        self.attempt(self.PASSWORD)
+
+        self.assertIsNone(self.logged_in())
+
+    def test_blocked_attempt_says_why(self):
+        self.fail_times(LOCKOUT_THRESHOLD)
+
+        response = self.attempt(self.PASSWORD)
+        body = response.content.decode()
+
+        self.assertIn("locked", body)
+        # "incorrect password" would be actively misleading to someone
+        # who has since remembered the right one. The login template
+        # used to print exactly that for any failure, so a locked user
+        # was given two contradictory reasons at once.
+        self.assertNotIn("password is incorrect", body)
+
+    def test_a_wrong_password_still_says_so(self):
+        """Guards the template change made for the test above.
+
+        Removing the hardcoded failure message must not leave an
+        ordinary wrong password with no explanation at all.
+        """
+        response = self.attempt("wrong-password")
+
+        self.assertIn("incorrect", response.content.decode())
+
+    def test_locking_records_a_security_event(self):
+        self.fail_times(LOCKOUT_THRESHOLD)
+
+        event = SecurityEvent.objects.filter(
+            event=SecurityEventType.ACCOUNT_LOCKED,
+        ).get()
+
+        self.assertEqual(event.user, self.user)
+        self.assertEqual(event.email_attempted, "asha@example.com")
+        self.assertIsNotNone(event.source_ip, "no source IP recorded")
+        self.assertIn("15 minutes", event.detail)
+
+    def test_only_one_lock_event_per_lock(self):
+        """Further failures must not each write another lock row."""
+        self.fail_times(LOCKOUT_THRESHOLD + 3)
+
+        self.assertEqual(
+            SecurityEvent.objects.filter(
+                event=SecurityEventType.ACCOUNT_LOCKED,
+            ).count(),
+            1,
+        )
+
+    def test_attempts_during_a_lock_are_recorded(self):
+        """What distinguishes a forgotten password from an attack."""
+        self.fail_times(LOCKOUT_THRESHOLD)
+        self.attempt("wrong-password")
+        self.attempt(self.PASSWORD)
+
+        self.assertEqual(
+            SecurityEvent.objects.filter(
+                event=SecurityEventType.LOGIN_BLOCKED,
+            ).count(),
+            2,
+        )
+
+    def test_attempts_during_a_lock_do_not_extend_it(self):
+        """Otherwise an attacker could keep an account locked forever."""
+        self.fail_times(LOCKOUT_THRESHOLD)
+        locked_until = self.profile().locked_until
+
+        self.fail_times(3)
+
+        self.assertEqual(self.profile().locked_until, locked_until)
+
+    def test_login_succeeds_once_the_lock_expires(self):
+        self.fail_times(LOCKOUT_THRESHOLD)
+
+        # An expired lock reads as unlocked with nothing to clear it,
+        # so no scheduled job is needed for the lock to lift.
+        UserProfile.objects.filter(user=self.user).update(
+            locked_until=timezone.now() - timedelta(seconds=1),
+        )
+
+        self.attempt(self.PASSWORD)
+
+        self.assertEqual(self.logged_in(), str(self.user.pk))
+
+    def test_successful_login_clears_the_failure_count(self):
+        """'Consecutive' is the operative word in SCMS-F-005."""
+        self.fail_times(LOCKOUT_THRESHOLD - 1)
+        self.attempt(self.PASSWORD)
+
+        self.assertEqual(self.profile().failed_login_attempts, 0)
+
+        self.client.logout()
+        self.fail_times(LOCKOUT_THRESHOLD - 1)
+
+        self.assertIsNone(self.profile().locked_until)
+
+    def test_lockout_is_per_account(self):
+        self.fail_times(LOCKOUT_THRESHOLD)
+
+        self.assertIsNone(self.profile(self.other).locked_until)
+
+        self.attempt(self.PASSWORD, email="bala@example.com")
+
+        self.assertEqual(self.logged_in(), str(self.other.pk))
+
+    def test_unknown_email_records_no_event(self):
+        """Nothing to lock, and no row naming an account that is not."""
+        self.fail_times(LOCKOUT_THRESHOLD, email="nobody@example.com")
+
+        self.assertEqual(SecurityEvent.objects.count(), 0)
+
+    def test_security_events_cannot_be_altered_or_deleted(self):
+        self.fail_times(LOCKOUT_THRESHOLD)
+        event = SecurityEvent.objects.get(
+            event=SecurityEventType.ACCOUNT_LOCKED,
+        )
+
+        with self.assertRaises(ValueError):
+            event.detail = "nothing happened"
+            event.save()
+
+        with self.assertRaises(ValueError):
+            event.delete()
+
+        # The queryset routes bypass Model.save and Model.delete, so
+        # they need their own guard (the same bug found in T8-34).
+        with self.assertRaises(ValueError):
+            SecurityEvent.objects.all().delete()
+
+        with self.assertRaises(ValueError):
+            SecurityEvent.objects.all().update(detail="nothing happened")
 
 
 class RoleFixture(BaseFixture):
