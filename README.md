@@ -47,8 +47,10 @@ complaint stands.
 
 ```
 scms-team8/
+├── .github/workflows/ci.yml  Lint, migration check and tests on every push
 ├── docs/                     SRS, SAD and Test Plan
-├── requirements.txt
+├── requirements.txt          What the application needs to run
+├── requirements-dev.txt      The above, plus the linter
 └── src/
     ├── manage.py
     ├── config/               Django project settings and root URLs
@@ -111,10 +113,61 @@ DB_PORT=5432
 
 ### Running the tests
 
+On SQLite, which needs nothing installed:
+
 ```bash
 cd src
 python manage.py test complaints --settings=config.settings_local
 ```
+
+On PostgreSQL, with a `.env` as above — slower to set up, but it is
+what CI runs and what the application is deployed on:
+
+```bash
+cd src
+python manage.py test complaints
+```
+
+Both should report **219 tests, OK**.
+
+### Checking it the way CI does
+
+```bash
+pip install -r requirements-dev.txt
+cd src
+flake8 complaints config
+python manage.py makemigrations --check --dry-run
+python manage.py test complaints
+```
+
+---
+
+## Continuous integration
+
+`.github/workflows/ci.yml` runs on every push to `main` and on every
+pull request. Each run does three things:
+
+| Step | Catches |
+|------|---------|
+| `flake8 complaints config` | Style and unused-import errors |
+| `makemigrations --check --dry-run` | A model changed without its migration generated |
+| `python manage.py test complaints` | Any broken behaviour, on **PostgreSQL 14** |
+
+The result shows as a tick or a cross on the pull request, so a change
+that breaks the suite is caught before review rather than after merge.
+
+Two deliberate choices:
+
+**It runs on PostgreSQL, not SQLite.** `settings_local` exists for
+convenience, but SQLite is not equivalent to the deployment target. It
+silently ignores the row-level lock in `generate_reference_id()` and
+treats `LIKE` as case-insensitive where PostgreSQL does not, so a test
+can pass on SQLite for a reason that does not hold in production.
+
+**It runs on Python 3.11 and 3.13** — the floor the SAD commits to and
+the version the team develops on. That makes the portability claim in
+SCMS-NF-006 something the build tests rather than something the
+document asserts.
 
 ---
 
