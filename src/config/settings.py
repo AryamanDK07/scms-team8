@@ -147,10 +147,21 @@ USE_TZ = True
 STATIC_URL = 'static/'
 
 # Uploaded evidence (SCMS-F-008, SCMS-SR-005)
-# MEDIA_ROOT sits outside the web root and no MEDIA_URL is served,
-# so an attachment cannot be fetched by URL. Files are read back
-# through complaint_attachment_download, which checks access first.
+# MEDIA_ROOT sits outside the web root and no URL route serves files
+# from it, so an attachment cannot be fetched by URL. (MEDIA_URL is
+# not the control here: Django defaults it to "/" whether or not
+# anything serves it. What matters is that config.urls adds no
+# static-serve route, which SecureEvidenceStorageTests asserts.)
+# Files are read back through complaint_attachment_download, which
+# checks access first.
 MEDIA_ROOT = BASE_DIR.parent / "private-media"
+
+# Malware scanning for uploads (SCMS-SR-005).
+# The dotted path of a callable taking the upload and returning a
+# truthy verdict for an infected file. Empty means no scanning: no
+# scanner is available to this project, and complaints.attachments
+# says so rather than substituting one that always returns "clean".
+ATTACHMENT_MALWARE_SCANNER = os.getenv("ATTACHMENT_MALWARE_SCANNER", "")
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
