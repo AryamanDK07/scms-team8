@@ -90,6 +90,26 @@ DATABASES = {
 }
 
 
+# Password hashing (SCMS-SR-002)
+# Argon2id is the requirement. Django's Argon2PasswordHasher uses the
+# id variant, which is the one resistant to both side-channel and
+# GPU-based attacks; the stored hash records this as argon2$argon2id$.
+#
+# The order matters as much as the first entry. Django hashes with the
+# first hasher and verifies against any in the list, so keeping the
+# PBKDF2 hashers below means accounts created before this change can
+# still sign in. On a correct login Django re-hashes the password with
+# the first hasher, so those accounts move to Argon2id as their owners
+# return, without anyone needing to reset a password. Removing the
+# PBKDF2 entries would lock out every existing account instead.
+
+PASSWORD_HASHERS = [
+    "django.contrib.auth.hashers.Argon2PasswordHasher",
+    "django.contrib.auth.hashers.PBKDF2PasswordHasher",
+    "django.contrib.auth.hashers.PBKDF2SHA1PasswordHasher",
+]
+
+
 # Password validation
 # https://docs.djangoproject.com/en/5.2/ref/settings/#auth-password-validators
 

@@ -1,3 +1,4 @@
+import logging
 import re
 import shutil
 import tempfile
@@ -6,6 +7,7 @@ from unittest.mock import patch
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.contrib.auth.hashers import make_password
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
 from django.contrib.sessions.models import Session
 from django.core import mail
@@ -2618,6 +2620,163 @@ class AuditTrailCompletenessTests(BaseFixture):
             pass
 
         self.assertEqual(complaint.status_history.count(), before)
+
+
+class PasswordHashingTests(TestCase):
+    """SCMS-SR-002 / TC-Sec-02: Argon2id, and never in the clear.
+
+    The acceptance criterion is stated as two checks an assessor would
+    run by hand: inspect the database and see only hashes, then grep
+    the logs for the password and find nothing. Both are asserted here
+    so they hold on every run rather than on the day someone looks.
+    """
+
+    LOGIN_URL = "/accounts/login/"
+    PASSWORD = "not-a-real-password"
+    ARGON2ID_PREFIX = "argon2$argon2id$"
+
+    def setUp(self):
+        self.User = get_user_model()
+        self.user = self.User.objects.create_user(
+            username="asha",
+            email="asha@example.com",
+            password=self.PASSWORD,
+        )
+
+    def stored_hash(self):
+        return self.User.objects.get(pk=self.user.pk).password
+
+    def test_configured_hasher_is_argon2(self):
+        """Guards the order in settings, not just today's behaviour."""
+        self.assertEqual(
+            settings.PASSWORD_HASHERS[0],
+            "django.contrib.auth.hashers.Argon2PasswordHasher",
+        )
+
+    def test_new_password_is_stored_as_argon2id(self):
+        # The variant matters: SCMS-SR-002 names Argon2id, and argon2i
+        # or argon2d would both satisfy a looser check for "argon2".
+        self.assertTrue(
+            self.stored_hash().startswith(self.ARGON2ID_PREFIX),
+            f"stored as {self.stored_hash()[:24]}, not Argon2id",
+        )
+
+    def test_raw_password_does_not_appear_in_the_record(self):
+        """The database-inspection half of TC-Sec-02."""
+        for field in (self.stored_hash(), repr(self.user.__dict__)):
+            self.assertNotIn(self.PASSWORD, field)
+
+    def test_password_is_not_written_to_any_log(self):
+        """The log-grep half of TC-Sec-02.
+
+        The first version of this test captured the root logger across
+        a login and asserted the password appeared in none of the
+        records. It passed, but for no reason: the login path emits no
+        log records at all, so the loop ran zero times. A test that
+        cannot fail proves nothing.
+
+        It now enables SQL logging, which is both what a log grep on a
+        running system would actually hit and a direct check that the
+        raw password never travels as far as the database. The record
+        count is asserted first so this can never go hollow again.
+        """
+        records = []
+
+        class Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        handler = Capture()
+        queries = logging.getLogger("django.db.backends")
+        previous_level = queries.level
+        queries.addHandler(handler)
+        queries.setLevel(logging.DEBUG)
+
+        try:
+            # django.db.backends logs statements only while DEBUG is on.
+            with override_settings(DEBUG=True):
+                self.User.objects.create_user(
+                    username="logcheck",
+                    email="logcheck@example.com",
+                    password=self.PASSWORD,
+                )
+                self.client.post(
+                    self.LOGIN_URL,
+                    {
+                        "username": "logcheck@example.com",
+                        "password": self.PASSWORD,
+                    },
+                )
+        finally:
+            queries.removeHandler(handler)
+            queries.setLevel(previous_level)
+
+        self.assertGreater(
+            len(records), 0, "nothing was logged, so nothing was checked",
+        )
+
+        for record in records:
+            self.assertNotIn(
+                self.PASSWORD,
+                record.getMessage(),
+                f"password reached the {record.name} log",
+            )
+
+    def test_password_is_not_echoed_back_in_the_response(self):
+        response = self.client.post(
+            self.LOGIN_URL,
+            {"username": "asha@example.com", "password": "wrong-one"},
+        )
+
+        self.assertNotIn(b"wrong-one", response.content)
+
+    def test_account_hashed_before_the_change_still_authenticates(self):
+        """Accounts created under PBKDF2 must not be locked out."""
+        legacy = make_password(self.PASSWORD, hasher="pbkdf2_sha256")
+        self.User.objects.filter(pk=self.user.pk).update(password=legacy)
+
+        self.assertTrue(self.stored_hash().startswith("pbkdf2_sha256$"))
+
+        self.client.post(
+            self.LOGIN_URL,
+            {"username": "asha@example.com", "password": self.PASSWORD},
+        )
+
+        self.assertEqual(
+            self.client.session.get("_auth_user_id"), str(self.user.pk),
+        )
+
+    def test_legacy_hash_is_upgraded_on_a_correct_login(self):
+        """Why no password reset is needed to satisfy SCMS-SR-002.
+
+        Django re-hashes with the first configured hasher when a login
+        succeeds against an older one, so existing accounts migrate as
+        their owners return.
+        """
+        legacy = make_password(self.PASSWORD, hasher="pbkdf2_sha256")
+        self.User.objects.filter(pk=self.user.pk).update(password=legacy)
+
+        self.client.post(
+            self.LOGIN_URL,
+            {"username": "asha@example.com", "password": self.PASSWORD},
+        )
+
+        self.assertTrue(
+            self.stored_hash().startswith(self.ARGON2ID_PREFIX),
+            "legacy hash was not upgraded on a correct login",
+        )
+
+    def test_wrong_password_does_not_upgrade_the_hash(self):
+        """A failed attempt must not touch the stored credential."""
+        legacy = make_password(self.PASSWORD, hasher="pbkdf2_sha256")
+        self.User.objects.filter(pk=self.user.pk).update(password=legacy)
+
+        self.client.post(
+            self.LOGIN_URL,
+            {"username": "asha@example.com", "password": "wrong-one"},
+        )
+
+        self.assertEqual(self.stored_hash(), legacy)
 
 
 class RoleFixture(BaseFixture):
