@@ -28,6 +28,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
 
+    permissions:
+      contents: read
+      # Needed to post the figures onto the pull request.
+      pull-requests: write
+
     strategy:
       # Both versions are reported, rather than stopping at the first
       # failure, because "fails on 3.11 only" is the useful signal.
@@ -125,22 +130,47 @@ jobs:
       # count: the SCMS-SR-006 tests are PostgreSQL-only, and a run
       # where they silently skipped would otherwise look identical to
       # one where they passed.
-      - name: Publish the run summary
+      - name: Collect the figures
         if: always()
         working-directory: src
         run: |
           {
-            echo "## Python ${{ matrix.python-version }}"
+            echo "<!-- ci-figures-py${{ matrix.python-version }} -->"
+            echo "**Python ${{ matrix.python-version }} on PostgreSQL 14**"
             echo
-            echo "### Tests"
             echo '```'
             grep -E '^(Ran [0-9]+ test|OK|FAILED)' test-output.txt \
               || echo 'no result line; the suite did not finish'
+            tail -n 1 coverage-output.txt \
+              || echo 'no coverage figure; the suite did not finish'
             echo '```'
-            echo
-            echo "### Coverage"
-            echo '```'
-            tail -n 2 coverage-output.txt \
-              || echo 'no coverage report; the suite did not finish'
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
+          } > figures.md
+
+          cat figures.md >> "$GITHUB_STEP_SUMMARY"
+
+      # The summary page above is for a person with a browser. It is
+      # not readable through the API -- a check run reports its
+      # output.summary as null -- so a green tick alone cannot tell
+      # anyone whether the PostgreSQL-only tests from T8-48 ran or
+      # silently skipped. Posting the same figures as a comment puts
+      # them where both a reviewer and a tool can read them.
+      - name: Report the figures on the pull request
+        if: always() && github.event_name == 'pull_request'
+        working-directory: src
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          MARKER: "<!-- ci-figures-py${{ matrix.python-version }} -->"
+        run: |
+          # One comment per Python version, updated in place, so a
+          # branch pushed ten times does not leave twenty comments.
+          existing=$(gh api "repos/$REPO/issues/$PR/comments" --paginate \
+            --jq "[.[] | select(.body | contains(\"$MARKER\"))][0].id")
+
+          if [ -n "$existing" ] && [ "$existing" != "null" ]; then
+            gh api "repos/$REPO/issues/comments/$existing" \
+              -X PATCH -F body=@figures.md
+          else
+            gh api "repos/$REPO/issues/$PR/comments" -F body=@figures.md
+          fi
