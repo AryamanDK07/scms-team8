@@ -137,8 +137,22 @@ pip install -r requirements-dev.txt
 cd src
 flake8 complaints config
 python manage.py makemigrations --check --dry-run
-python manage.py test complaints
+coverage run --rcfile=../.coveragerc manage.py test complaints
+coverage report --rcfile=../.coveragerc
 ```
+
+### Test coverage
+
+SCMS-NF-005 requires at least 70% line coverage. The suite measures
+**93.8%** over `complaints` and `config`, so CI gates at 90 rather
+than 70: a gate at the minimum would let a quarter of that
+protection disappear without anything objecting, while the
+requirement still read as met.
+
+`.coveragerc` explains what is excluded from the measurement and
+why — chiefly `tests.py`, which would otherwise add around twenty
+points of coverage that say nothing about how well the application
+is tested.
 
 ### Audit log privileges (deployment)
 
@@ -168,14 +182,19 @@ pull request. Each run does three things:
 
 | Step | Catches |
 |------|---------|
-| `flake8 complaints config` | Style and unused-import errors |
+| `flake8 complaints config` | Style and unused-import errors (SCMS-NF-005) |
 | `makemigrations --check --dry-run` | A model changed without its migration generated |
-| `python manage.py test complaints` | Any broken behaviour, on **PostgreSQL 14** |
+| `coverage run manage.py test complaints` | Any broken behaviour, on **PostgreSQL 14** |
+| `coverage report --fail-under=90` | Test coverage slipping (SCMS-NF-005) |
 
 The result shows as a tick or a cross on the pull request, so a change
 that breaks the suite is caught before review rather than after merge.
+Each run also publishes its test and coverage figures to the run's
+summary page, including the **skip count** — some tests are
+PostgreSQL-only, and a run where they silently skipped would
+otherwise look identical to one where they passed.
 
-Two deliberate choices:
+Three deliberate choices:
 
 **It runs on PostgreSQL, not SQLite.** `settings_local` exists for
 convenience, but SQLite is not equivalent to the deployment target. It
@@ -187,6 +206,13 @@ can pass on SQLite for a reason that does not hold in production.
 the version the team develops on. That makes the portability claim in
 SCMS-NF-006 something the build tests rather than something the
 document asserts.
+
+**The coverage gate is 90, not the required 70.** The suite measures
+93.8%. A gate at the minimum would let a quarter of that protection
+be lost without anything objecting, while SCMS-NF-005 still read as
+met. Set near the current level, the gate guards what the suite
+actually covers, and lowering it becomes a decision someone has to
+make deliberately.
 
 ---
 

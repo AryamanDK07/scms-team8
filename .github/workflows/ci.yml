@@ -95,4 +95,52 @@ jobs:
 
       - name: Run the test suite against PostgreSQL
         working-directory: src
-        run: python manage.py test complaints --verbosity 2
+        run: |
+          set -o pipefail
+          coverage run --rcfile=../.coveragerc manage.py test complaints \
+            2>&1 | tee test-output.txt
+
+      # SCMS-NF-005 asks for at least 70% line coverage. Asserting it
+      # here rather than measuring it once by hand is the difference
+      # between a requirement that holds and a figure that was true
+      # on the day someone looked.
+      #
+      # The gate is set at 90, not at the required 70. The project
+      # measured 93.8% when this was added, so a gate at 70 would let
+      # a quarter of that protection be lost without anything
+      # objecting, and the requirement would still read as met. Set
+      # near the current level, the gate guards what the suite
+      # actually covers. Lowering it is then a deliberate decision
+      # someone has to make and justify, which is the point.
+      - name: Coverage gate
+        working-directory: src
+        run: |
+          set -o pipefail
+          coverage report --rcfile=../.coveragerc --fail-under=90 \
+            2>&1 | tee coverage-output.txt
+
+      # Puts the test and coverage figures on the run's summary page,
+      # so the numbers can be read from the run itself rather than by
+      # scrolling the log. The skip count matters as much as the pass
+      # count: the SCMS-SR-006 tests are PostgreSQL-only, and a run
+      # where they silently skipped would otherwise look identical to
+      # one where they passed.
+      - name: Publish the run summary
+        if: always()
+        working-directory: src
+        run: |
+          {
+            echo "## Python ${{ matrix.python-version }}"
+            echo
+            echo "### Tests"
+            echo '```'
+            grep -E '^(Ran [0-9]+ test|OK|FAILED)' test-output.txt \
+              || echo 'no result line; the suite did not finish'
+            echo '```'
+            echo
+            echo "### Coverage"
+            echo '```'
+            tail -n 2 coverage-output.txt \
+              || echo 'no coverage report; the suite did not finish'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
