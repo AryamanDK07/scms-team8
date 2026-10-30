@@ -1,0 +1,12 @@
+# Tools needed to develop and check the project, but not to run it.
+# Install with: pip install -r requirements-dev.txt
+#
+# flake8 is the project's linter and .flake8 holds its configuration,
+# but until now the tool itself was pinned nowhere. Two developers on
+# different flake8 versions could get different answers from the same
+# file, and CI could disagree with both. Pinning it makes the lint
+# result reproducible.
+
+-r requirements.txt
+
+flake8==7.4.1

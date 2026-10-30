@@ -1,0 +1,98 @@
+# Continuous integration for the Smart Complaint Management System.
+#
+# Runs on every push to main and every pull request, so a change that
+# breaks the suite is visible on the pull request before it is merged
+# rather than after.
+#
+# The suite runs against PostgreSQL, not SQLite. config.settings_local
+# exists so a developer can work without installing a database server,
+# but SQLite is not the deployment target and is not equivalent to it:
+# it silently ignores the row-level lock in generate_reference_id() and
+# treats LIKE as case-insensitive where PostgreSQL does not. Running CI
+# on PostgreSQL 14 is what makes SCMS-NF-006 a tested claim.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A second push to the same branch makes the first run's answer
+# obsolete, so cancel it instead of paying for both.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      # Both versions are reported, rather than stopping at the first
+      # failure, because "fails on 3.11 only" is the useful signal.
+      fail-fast: false
+      matrix:
+        # The floor stated in SCMS-NF-006 and the version the team
+        # actually develops on. If it passes on both, the range
+        # between them is a reasonable bet.
+        python-version: ["3.11", "3.13"]
+
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_DB: scms_db
+          POSTGRES_USER: scms_user
+          POSTGRES_PASSWORD: scms_password
+        ports:
+          - 5432:5432
+        # Without the health check the first step can start before
+        # the server is accepting connections, which fails as a
+        # confusing OperationalError rather than a wait.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # config.settings reads each of these through os.getenv, so the
+      # workflow configures the real settings module rather than a
+      # CI-only copy of it that could drift out of step.
+      DB_NAME: scms_db
+      DB_USER: scms_user
+      DB_PASSWORD: scms_password
+      DB_HOST: 127.0.0.1
+      DB_PORT: "5432"
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        working-directory: src
+        run: flake8 complaints config
+
+      # A model edited without its migration generated passes the
+      # tests on a freshly built test database and then fails on a
+      # real one. This catches that before review.
+      - name: Check for missing migrations
+        working-directory: src
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: Run the test suite against PostgreSQL
+        working-directory: src
+        run: python manage.py test complaints --verbosity 2
