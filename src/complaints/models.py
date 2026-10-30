@@ -489,11 +489,75 @@ class UserProfile(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
+    # Brute-force lockout (SCMS-F-005). These live on the profile
+    # rather than in a table of attempts because the requirement is
+    # about *consecutive* failures: a correct password resets the
+    # count, so only the current run and the current lock matter,
+    # and a row per attempt would be an unbounded log of something
+    # nothing reads. The lockout itself is recorded as a
+    # SecurityEvent, which is the part that must be kept.
+    failed_login_attempts = models.PositiveSmallIntegerField(default=0)
+    locked_until = models.DateTimeField(null=True, blank=True)
+
     class Meta:
         ordering = ["user__username"]
 
     def __str__(self):
         return f"{self.user} ({self.get_role_display()})"
+
+
+class SecurityEventType(models.TextChoices):
+    ACCOUNT_LOCKED = "ACCOUNT_LOCKED", "Account locked"
+    LOGIN_BLOCKED = "LOGIN_BLOCKED", "Login attempt while locked"
+
+
+class SecurityEvent(models.Model):
+    """Append-only record of authentication security events.
+
+    SCMS-F-005 requires an audit entry when an account is locked.
+    ComplaintStatusHistory cannot carry it: every row there hangs
+    off a complaint, and a failed login belongs to no complaint.
+
+    The e-mail that was tried is stored alongside the user, not
+    instead of it. An attempt against an address with no account
+    still deserves a record, and the address as typed is what makes
+    a run of attempts legible afterwards.
+    """
+
+    objects = AppendOnlyQuerySet.as_manager()
+
+    event = models.CharField(
+        max_length=30,
+        choices=SecurityEventType.choices,
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="security_events",
+    )
+    email_attempted = models.CharField(max_length=254, blank=True)
+    source_ip = models.GenericIPAddressField(null=True, blank=True)
+    detail = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.get_event_display()} - {self.email_attempted}"
+
+    def save(self, *args, **kwargs):
+        if self.pk is not None:
+            raise ValueError(
+                AppendOnlyQuerySet.APPEND_ONLY.format("modified"),
+            )
+
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValueError(AppendOnlyQuerySet.APPEND_ONLY.format("deleted"))
 
 
 @receiver(post_save, sender=settings.AUTH_USER_MODEL)

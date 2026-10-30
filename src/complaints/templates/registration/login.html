@@ -11,12 +11,11 @@
         complaints.
     </p>
 
-    {% if form.errors %}
-        <p class="errorlist">
-            The e-mail address or password is incorrect.
-            Please try again.
-        </p>
-    {% endif %}
+    {# The form renders its own non-field errors, so there is no
+       hardcoded message here. There used to be one, which assumed
+       every failure was a wrong password: once lockout (SCMS-F-005)
+       was added, a locked-out user was told both that their password
+       was incorrect and that their account was locked. #}
 
     <form method="post">
         {% csrf_token %}
