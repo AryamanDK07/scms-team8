@@ -252,10 +252,16 @@ class AppendOnlyQuerySet(models.QuerySet):
     .all().delete() would erase the audit trail while the model
     looked protected. These refuse at the queryset level too.
 
-    This is application-level enforcement. The database-level half
-    of SCMS-SR-006 -- withholding UPDATE and DELETE from the
-    application's database role -- is deployment configuration and
-    is tracked separately in T8-48.
+    This is application-level enforcement, and it only binds code
+    that goes through Django. The database-level half of
+    SCMS-SR-006 was added in T8-48: migration 0011 puts a trigger
+    on each audit table that refuses UPDATE and DELETE from any
+    connection, and deploy/audit_privileges.sql withholds those
+    privileges from the application's database role.
+
+    Both are kept. This one gives a clear Python error at the point
+    of the mistake; the trigger is what holds when something
+    bypasses the ORM entirely.
     """
 
     APPEND_ONLY = (

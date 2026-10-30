@@ -140,6 +140,25 @@ python manage.py makemigrations --check --dry-run
 python manage.py test complaints
 ```
 
+### Audit log privileges (deployment)
+
+The audit tables are append-only. Migration 0011 enforces that with
+a database trigger, so it holds for every connection without any
+setup. SCMS-SR-006 additionally requires the application's database
+role to hold no UPDATE or DELETE privilege on those tables, which is
+deployment configuration:
+
+```bash
+psql -d scms_db -f deploy/audit_privileges.sql
+```
+
+Read the comments in that file before running it. It creates a
+second role, because revoking a privilege from the role that *owns*
+a table achieves nothing — the owner can grant it straight back. A
+single-role deployment meets the trigger half of SCMS-SR-006 but not
+the privilege half, and the file says so rather than pretending
+otherwise.
+
 ---
 
 ## Continuous integration

@@ -3,6 +3,7 @@ import re
 import shutil
 import tempfile
 from datetime import datetime, timedelta
+from unittest import skipUnless
 from unittest.mock import patch
 
 from django.conf import settings
@@ -12,6 +13,7 @@ from django.contrib.auth.tokens import PasswordResetTokenGenerator
 from django.contrib.sessions.models import Session
 from django.core import mail
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.db import DatabaseError, connection, transaction
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
@@ -2968,6 +2970,156 @@ class AccountLockoutTests(TestCase):
 
         with self.assertRaises(ValueError):
             SecurityEvent.objects.all().update(detail="nothing happened")
+
+
+@skipUnless(
+    connection.vendor == "postgresql",
+    "SCMS-SR-006 is enforced on PostgreSQL, the deployment target; "
+    "migration 0011 is a no-op on SQLite",
+)
+class DatabaseLevelAuditGuardTests(BaseFixture):
+    """SCMS-SR-006 / TC-Sec-06: the trail resists the database itself.
+
+    T8-34 made these tables append-only in the application. That
+    binds code going through Django and nothing else: anything with
+    the database credentials could still rewrite the trail, which is
+    exactly what an audit log exists to survive.
+
+    These tests go around the ORM entirely and issue raw SQL, which
+    is what an attacker or a careless script would do. They run only
+    on PostgreSQL, so they are proven by CI rather than by a local
+    SQLite run -- which is a large part of why CI was moved onto
+    PostgreSQL in T8-99.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.complaint = self.make_complaint()
+        self.entry = ComplaintStatusHistory.objects.create(
+            complaint=self.complaint,
+            old_status="",
+            new_status=Complaint.Status.OPEN,
+            field_name="status",
+            old_value="",
+            new_value="Open",
+            changed_by=self.user,
+            source_ip="127.0.0.1",
+            comment="Complaint lodged.",
+        )
+        self.event = SecurityEvent.objects.create(
+            event=SecurityEventType.ACCOUNT_LOCKED,
+            user=self.user,
+            email_attempted="asha@example.com",
+            source_ip="127.0.0.1",
+            detail="Locked for 15 minutes.",
+        )
+
+    def run_sql(self, statement, params=None):
+        """Execute raw SQL inside its own atomic block.
+
+        A statement the database refuses marks the surrounding
+        transaction as failed on PostgreSQL, so without the nested
+        block every later query in the test would fail too and the
+        failure would look like something else.
+        """
+        with transaction.atomic():
+            with connection.cursor() as cursor:
+                cursor.execute(statement, params or [])
+
+    def test_complaint_audit_row_cannot_be_updated_by_raw_sql(self):
+        with self.assertRaises(DatabaseError) as caught:
+            self.run_sql(
+                "UPDATE complaints_complaintstatushistory "
+                "SET new_value = %s WHERE id = %s",
+                ["Closed", self.entry.pk],
+            )
+
+        self.assertIn("SCMS-SR-006", str(caught.exception))
+        self.entry.refresh_from_db()
+        self.assertEqual(self.entry.new_value, "Open")
+
+    def test_complaint_audit_row_cannot_be_deleted_by_raw_sql(self):
+        with self.assertRaises(DatabaseError) as caught:
+            self.run_sql(
+                "DELETE FROM complaints_complaintstatushistory "
+                "WHERE id = %s",
+                [self.entry.pk],
+            )
+
+        self.assertIn("SCMS-SR-006", str(caught.exception))
+        self.assertTrue(
+            ComplaintStatusHistory.objects.filter(pk=self.entry.pk).exists(),
+        )
+
+    def test_whole_complaint_trail_cannot_be_wiped(self):
+        """The unqualified statement an attacker would actually run."""
+        with self.assertRaises(DatabaseError):
+            self.run_sql("DELETE FROM complaints_complaintstatushistory")
+
+        self.assertTrue(ComplaintStatusHistory.objects.exists())
+
+    def test_security_event_cannot_be_updated_by_raw_sql(self):
+        with self.assertRaises(DatabaseError) as caught:
+            self.run_sql(
+                "UPDATE complaints_securityevent SET detail = %s "
+                "WHERE id = %s",
+                ["nothing happened", self.event.pk],
+            )
+
+        self.assertIn("SCMS-SR-006", str(caught.exception))
+
+    def test_security_event_cannot_be_deleted_by_raw_sql(self):
+        with self.assertRaises(DatabaseError) as caught:
+            self.run_sql(
+                "DELETE FROM complaints_securityevent WHERE id = %s",
+                [self.event.pk],
+            )
+
+        self.assertIn("SCMS-SR-006", str(caught.exception))
+
+    def test_rows_can_still_be_appended(self):
+        """Append-only must still mean append.
+
+        A guard that made the tables read-only would pass every test
+        above and break the audit trail completely, so the writable
+        half is asserted too.
+        """
+        ComplaintStatusHistory.objects.create(
+            complaint=self.complaint,
+            old_status=Complaint.Status.OPEN,
+            new_status=Complaint.Status.ASSIGNED,
+            field_name="status",
+            old_value="Open",
+            new_value="Assigned",
+            changed_by=self.user,
+            source_ip="127.0.0.1",
+            comment="Assigned.",
+        )
+        SecurityEvent.objects.create(
+            event=SecurityEventType.LOGIN_BLOCKED,
+            user=self.user,
+            email_attempted="asha@example.com",
+            source_ip="127.0.0.1",
+            detail="Login attempted while the account was locked.",
+        )
+
+        self.assertEqual(
+            ComplaintStatusHistory.objects.filter(
+                complaint=self.complaint,
+            ).count(),
+            2,
+        )
+        self.assertEqual(SecurityEvent.objects.count(), 2)
+
+    def test_ordinary_tables_are_still_writable(self):
+        """The guard must be on the audit tables and nowhere else."""
+        self.run_sql(
+            "UPDATE complaints_complaint SET title = %s WHERE id = %s",
+            ["Edited directly", self.complaint.pk],
+        )
+
+        self.complaint.refresh_from_db()
+        self.assertEqual(self.complaint.title, "Edited directly")
 
 
 class RoleFixture(BaseFixture):
