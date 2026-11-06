@@ -81,6 +81,60 @@
 </div>
 {% endif %}
 
+{# SCMS-F-020. Shown once the complaint is closed: either the
+   rating already given, or the form, to the complainant alone. #}
+{% if complaint.rating %}
+<div class="card">
+    <h2>Your rating</h2>
+    <p><strong>{{ complaint.rating.score }} out of 5</strong></p>
+    {% if complaint.rating.comment %}
+        <p style="white-space: pre-wrap">{{ complaint.rating.comment }}</p>
+    {% endif %}
+    <p class="muted">
+        Rated {{ complaint.rating.created_at|date:"d M Y, H:i" }}
+    </p>
+</div>
+{% elif can_rate %}
+<div class="card">
+    <h2>Rate this resolution</h2>
+    <p class="muted">
+        How satisfied are you with how this complaint was handled?
+        A rating cannot be changed once given.
+    </p>
+
+    <form method="post"
+          action="{% url 'complaints:complaint_rate' complaint.reference_id %}">
+        {% csrf_token %}
+
+        {% for error in rating_form.non_field_errors %}
+            <p class="errorlist">{{ error }}</p>
+        {% endfor %}
+
+        <p>
+            <label for="{{ rating_form.score.id_for_label }}">
+                Rating
+            </label>
+            {{ rating_form.score }}
+            {% for error in rating_form.score.errors %}
+                <span class="errorlist">{{ error }}</span>
+            {% endfor %}
+        </p>
+
+        <p>
+            <label for="{{ rating_form.comment.id_for_label }}">
+                Comment (optional)
+            </label>
+            {{ rating_form.comment }}
+            {% for error in rating_form.comment.errors %}
+                <span class="errorlist">{{ error }}</span>
+            {% endfor %}
+        </p>
+
+        <button type="submit" class="button">Submit rating</button>
+    </form>
+</div>
+{% endif %}
+
 <div class="card">
     <h2>Evidence</h2>
 

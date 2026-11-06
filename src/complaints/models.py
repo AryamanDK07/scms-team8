@@ -3,6 +3,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from django.conf import settings
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 from django.db.models.signals import post_save
 from django.dispatch import receiver
@@ -391,6 +392,59 @@ class ComplaintComment(models.Model):
 
     def __str__(self):
         return f"{self.complaint.reference_id}: {self.author}"
+
+
+class ComplaintRating(models.Model):
+    """The complainant's verdict on a closed complaint (SCMS-F-020).
+
+    One rating per complaint, enforced by the one-to-one field.
+    A rating cannot be changed once given: a department's average
+    is reported to its admins, and a score that can be revised
+    after the fact makes that average a moving figure nobody can
+    reconcile with what they saw last week.
+
+    Only the person who lodged the complaint may rate it, and only
+    once it is closed. Both are enforced in services.rate_complaint
+    rather than here, so the view and the admin cannot take
+    different views of who may rate what.
+    """
+
+    MINIMUM = 1
+    MAXIMUM = 5
+
+    complaint = models.OneToOneField(
+        Complaint,
+        on_delete=models.PROTECT,
+        related_name="rating",
+    )
+    score = models.PositiveSmallIntegerField(
+        validators=[
+            MinValueValidator(MINIMUM),
+            MaxValueValidator(MAXIMUM),
+        ],
+        help_text="1 (poor) to 5 (excellent).",
+    )
+    comment = models.TextField(blank=True, max_length=1000)
+    rated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="complaint_ratings",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.complaint.reference_id}: {self.score}/5"
+
+    def save(self, *args, **kwargs):
+        if self.pk is not None:
+            raise ValueError(
+                "A rating cannot be changed once given (SCMS-F-020)."
+            )
+
+        super().save(*args, **kwargs)
 
 
 def attachment_path(instance, filename):
