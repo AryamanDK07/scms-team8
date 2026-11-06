@@ -56,8 +56,8 @@
             Submit Complaint
         </button>
 
-        {# SCMS-F-010. Same form, so whatever has been typed is what
-           gets saved; the view skips validation for this button. #}
+        {% comment %} SCMS-F-010. Same form, so whatever has been typed is what
+           gets saved; the view skips validation for this button. {% endcomment %}
         <button class="button" type="submit" name="save_draft" value="1">
             Save as draft
         </button>

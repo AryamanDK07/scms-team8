@@ -15,6 +15,7 @@ from django.contrib.auth.hashers import make_password
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
 from django.contrib.sessions.models import Session
 from django.core import mail
+from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import DatabaseError, connection, transaction
 from django.test import TestCase, override_settings
@@ -37,6 +38,11 @@ from .models import (
     SecurityEventType,
     SubCategory,
     UserProfile,
+)
+from .ratelimit import (
+    LOGIN_LIMIT,
+    SUBMISSION_LIMIT,
+    too_many_submissions,
 )
 from .security import LOCKOUT_THRESHOLD
 from .exports import HEADERS as export_headers
@@ -94,6 +100,15 @@ def _scanner_that_reads_everything(upload):
     return None
 
 
+#: SCMS-SR-007 limits are off for the suite at large and switched
+#: on by the tests that are about them. Otherwise any test posting
+#: a form six times would trip a limit it was not written to
+#: exercise, and the failure would look like something else.
+limits_off = override_settings(RATE_LIMITS_ENABLED=False)
+limits_on = override_settings(RATE_LIMITS_ENABLED=True)
+
+
+@limits_off
 class BaseFixture(TestCase):
     def setUp(self):
         self.department = Department.objects.create(
@@ -246,6 +261,7 @@ class RoutingTests(BaseFixture):
         self.assertEqual(self.category.department, other)
 
 
+@limits_off
 class EmailLoginTests(TestCase):
     """SCMS-F-002 / TC-Auth-02: sign in with e-mail and password."""
 
@@ -318,6 +334,7 @@ class EmailLoginTests(TestCase):
         self.assertIsNone(self.logged_in_as())
 
 
+@limits_off
 class SessionExpiryTests(TestCase):
     """SCMS-F-002 / TC-Auth-02: 30 minutes of inactivity ends it."""
 
@@ -364,6 +381,7 @@ class SessionExpiryTests(TestCase):
         self.assertEqual(self.client.get("/").status_code, 200)
 
 
+@limits_off
 class PasswordResetTests(TestCase):
     """SCMS-F-004 / TC-Auth-04: single-use link, valid 15 minutes."""
 
@@ -2673,6 +2691,7 @@ class AuditTrailCompletenessTests(BaseFixture):
         self.assertEqual(complaint.status_history.count(), before)
 
 
+@limits_off
 class PasswordHashingTests(TestCase):
     """SCMS-SR-002 / TC-Sec-02: Argon2id, and never in the clear.
 
@@ -2830,6 +2849,7 @@ class PasswordHashingTests(TestCase):
         self.assertEqual(self.stored_hash(), legacy)
 
 
+@limits_off
 class AccountLockoutTests(TestCase):
     """SCMS-F-005 / TC-Auth-05: lock after 5 consecutive failures."""
 
@@ -3274,6 +3294,280 @@ class ObjectLevelAccessTests(RoleFixture):
         orphan.profile.delete()
         orphan.refresh_from_db()
         self.assertFalse(can_view_complaint(orphan, self.complaint))
+
+
+class TemplateCommentLeakTests(BaseFixture):
+    """No page may show its own source comments to a user.
+
+    Django's {# #} comment works on ONE line only. Spread over
+    two, the template engine does not recognise it and renders it
+    as text, so "{# SCMS-F-026. The links carry... #}" appeared at
+    the top of the staff queue in the browser.
+
+    Twelve templates had it, some since sprint 1. Nothing caught
+    it because every template test asserted that particular
+    strings were present, and none asserted that nothing unwanted
+    was. This test is the general form of the question.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.complaint = self.make_complaint(
+            assigned_department=self.department,
+        )
+        profile = self.user.profile
+        profile.role = Role.SYSTEM_ADMIN
+        profile.save()
+        self.client.force_login(self.user)
+
+    def assert_no_leak(self, url):
+        body = self.client.get(url).content.decode()
+
+        for marker in ("{#", "#}", "{%", "%}"):
+            self.assertNotIn(
+                marker,
+                body,
+                f"{url} is showing template source to the user",
+            )
+
+    def test_no_page_leaks_its_template_source(self):
+        for url in (
+            "/",
+            "/new/",
+            "/queue/",
+            "/dashboard/",
+            f"/{self.complaint.reference_id}/",
+            "/accounts/login/",
+        ):
+            with self.subTest(url=url):
+                self.assert_no_leak(url)
+
+
+@limits_on
+class RateLimitTests(BaseFixture):
+    """SCMS-SR-007 / TC-Sec-07: the 6th and the 11th are refused."""
+
+    def setUp(self):
+        super().setUp()
+        # The cache outlives a single test, so a counter left by the
+        # previous one would make these pass or fail for the wrong
+        # reason.
+        cache.clear()
+        self.sub_category = SubCategory.objects.create(
+            name="Projector", code="proj-rl", category=self.category,
+        )
+        self.client.force_login(self.user)
+
+    def tearDown(self):
+        cache.clear()
+        super().tearDown()
+
+    def lodge(self, n=1):
+        responses = []
+
+        for index in range(n):
+            responses.append(self.client.post("/new/", {
+                "title": f"Projector fault {index}",
+                "description": f"Report number {index} about the room.",
+                "location": "Room 302",
+                "category": str(self.category.pk),
+                "sub_category": str(self.sub_category.pk),
+            }))
+
+        return responses
+
+    def test_the_sixth_submission_in_an_hour_is_refused(self):
+        self.lodge(SUBMISSION_LIMIT)
+
+        self.assertEqual(Complaint.objects.count(), SUBMISSION_LIMIT)
+
+        self.lodge(1)
+
+        self.assertEqual(
+            Complaint.objects.count(),
+            SUBMISSION_LIMIT,
+            "the sixth submission was stored anyway",
+        )
+
+    def test_the_refusal_says_why(self):
+        self.lodge(SUBMISSION_LIMIT)
+        response = self.lodge(1)[0]
+
+        self.assertContains(response, "limit")
+
+    def test_the_limit_is_per_account(self):
+        """One person's flood must not lock out everybody else."""
+        self.lodge(SUBMISSION_LIMIT)
+
+        other = get_user_model().objects.create_user(
+            username="second", password="not-a-real-password",
+        )
+        self.client.force_login(other)
+
+        self.lodge(1)
+
+        self.assertEqual(
+            Complaint.objects.count(), SUBMISSION_LIMIT + 1,
+        )
+
+    def test_the_eleventh_login_attempt_is_refused(self):
+        self.client.logout()
+
+        for _ in range(LOGIN_LIMIT):
+            self.client.post("/accounts/login/", {
+                "username": "nobody@example.com",
+                "password": "wrong-password",
+            })
+
+        response = self.client.post("/accounts/login/", {
+            "username": "nobody@example.com",
+            "password": "wrong-password",
+        })
+
+        self.assertContains(response, "Too many sign-in attempts")
+
+    def test_the_login_limit_does_not_block_a_fresh_address(self):
+        self.client.logout()
+
+        for _ in range(LOGIN_LIMIT + 2):
+            self.client.post("/accounts/login/", {
+                "username": "nobody@example.com",
+                "password": "wrong-password",
+            })
+
+        # A different IP has its own counter.
+        response = self.client.post(
+            "/accounts/login/",
+            {"username": "nobody@example.com", "password": "wrong"},
+            REMOTE_ADDR="10.0.0.9",
+        )
+
+        self.assertNotContains(response, "Too many sign-in attempts")
+
+    def test_the_counter_expires_with_its_window(self):
+        """Nothing has to sweep the counters; the cache does it."""
+        self.assertFalse(too_many_submissions(self.user))
+
+        cache.clear()
+
+        for _ in range(SUBMISSION_LIMIT):
+            self.assertFalse(too_many_submissions(self.user))
+
+        self.assertTrue(too_many_submissions(self.user))
+
+
+class DeactivationTests(BaseFixture):
+    """SCMS-F-024 / TC-Admin-02: a deactivated account is shut out."""
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.agent = get_user_model().objects.create_user(
+            username="leaver",
+            email="leaver@example.com",
+            password="not-a-real-password",
+        )
+        profile = self.agent.profile
+        profile.role = Role.SUPPORT_AGENT
+        profile.department = self.department
+        profile.save()
+
+        self.stayer = get_user_model().objects.create_user(
+            username="stayer",
+            email="stayer@example.com",
+            password="not-a-real-password",
+        )
+        stays = self.stayer.profile
+        stays.role = Role.SUPPORT_AGENT
+        stays.department = self.department
+        stays.save()
+
+        self.complaint = self.make_complaint(
+            assigned_department=self.department,
+            assigned_to=self.agent,
+        )
+
+    def login_as_leaver(self):
+        return self.client.post("/accounts/login/", {
+            "username": "leaver@example.com",
+            "password": "not-a-real-password",
+        })
+
+    def test_an_active_account_can_log_in(self):
+        """The control, so the refusal below means something."""
+        self.login_as_leaver()
+
+        self.assertEqual(
+            self.client.session.get("_auth_user_id"), str(self.agent.pk),
+        )
+
+    def test_a_deactivated_account_cannot_log_in(self):
+        self.agent.is_active = False
+        self.agent.save(update_fields=["is_active"])
+
+        self.login_as_leaver()
+
+        self.assertIsNone(self.client.session.get("_auth_user_id"))
+
+    def test_their_open_complaints_are_still_reassignable(self):
+        """The second half of the criterion, and the easier one to miss.
+
+        Shutting someone out is no use if their work becomes
+        unassignable with them.
+        """
+        self.agent.is_active = False
+        self.agent.save(update_fields=["is_active"])
+
+        candidates = eligible_agents(self.complaint)
+
+        self.assertIn(self.stayer, candidates)
+        self.assertNotIn(self.agent, candidates)
+
+        assign_complaint(
+            self.complaint, agent=self.stayer, actor=self.user,
+            reason="Previous agent deactivated.",
+        )
+
+        self.complaint.refresh_from_db()
+        self.assertEqual(self.complaint.assigned_to, self.stayer)
+
+    def test_a_deactivated_agent_is_not_offered_for_new_work(self):
+        self.agent.is_active = False
+        self.agent.save(update_fields=["is_active"])
+
+        fresh = self.make_complaint(assigned_department=self.department)
+
+        self.assertNotIn(self.agent, eligible_agents(fresh))
+
+    def test_roles_are_editable_from_the_admin(self):
+        """SCMS-F-024's 'change roles' half, through the real page."""
+        from .roles import Role
+
+        admin = get_user_model().objects.create_superuser(
+            username="root", email="root@example.com",
+            password="not-a-real-password",
+        )
+        self.client.force_login(admin)
+
+        response = self.client.get(
+            f"/admin/auth/user/{self.agent.pk}/change/",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        # The inline's own field, which is what makes the role
+        # editable from the user's page at all.
+        self.assertContains(response, "profile-0-role")
+
+        self.agent.profile.role = Role.DEPARTMENT_ADMIN
+        self.agent.profile.save()
+        self.agent.refresh_from_db()
+
+        self.assertEqual(
+            self.agent.profile.role, Role.DEPARTMENT_ADMIN,
+        )
 
 
 class DraftTests(BaseFixture):

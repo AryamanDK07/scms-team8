@@ -163,6 +163,14 @@ MEDIA_ROOT = BASE_DIR.parent / "private-media"
 # says so rather than substituting one that always returns "clean".
 ATTACHMENT_MALWARE_SCANNER = os.getenv("ATTACHMENT_MALWARE_SCANNER", "")
 
+
+# Rate limits (SCMS-SR-007).
+# On by default; the suite turns them off except in the tests that
+# are about limits, so a test that posts a form twice does not trip
+# one by accident. complaints.ratelimit records what the default
+# local-memory cache means for a multi-instance deployment.
+RATE_LIMITS_ENABLED = True
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 

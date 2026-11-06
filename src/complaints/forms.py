@@ -2,7 +2,7 @@ from django import forms
 from django.contrib.auth import get_user_model
 from django.contrib.auth.forms import AuthenticationForm
 
-from . import security
+from . import ratelimit, security
 from .attachments import AttachmentRejected, validate_upload
 from .models import (
     AttachmentKind,
@@ -42,6 +42,10 @@ class EmailLoginForm(AuthenticationForm):
             "The e-mail address or password is incorrect. "
             "Please try again."
         ),
+        "rate_limited": (
+            "Too many sign-in attempts from this network. Wait a "
+            "few minutes and try again."
+        ),
         "account_locked": (
             "This account is locked after too many failed sign-in "
             "attempts. Try again in %(minutes)s minute%(plural)s, or "
@@ -50,7 +54,11 @@ class EmailLoginForm(AuthenticationForm):
     }
 
     def clean(self):
-        """Replace the generic refusal with the lockout message.
+        """Throttle by IP, then replace the refusal with the reason.
+
+        The limit is checked before the credentials, so a flood of
+        attempts costs one cache increment rather than a password
+        hash each (SCMS-SR-007).
 
         SCMS-F-005 requires the blocked attempt to say why, and
         "incorrect password" would be actively misleading to someone
@@ -62,6 +70,16 @@ class EmailLoginForm(AuthenticationForm):
         a lock out of the audit trail, which is the part that shows
         whether someone kept trying.
         """
+        source_ip = (
+            self.request.META.get("REMOTE_ADDR") if self.request else None
+        )
+
+        if ratelimit.too_many_logins(source_ip):
+            raise forms.ValidationError(
+                self.error_messages["rate_limited"],
+                code="rate_limited",
+            )
+
         try:
             return super().clean()
         except forms.ValidationError:

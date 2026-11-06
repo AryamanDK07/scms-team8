@@ -6,7 +6,7 @@ from django.http import FileResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from .services import calculate_sla_deadline
 
-from . import exports
+from . import exports, ratelimit
 from .attachments import (
     MAX_PER_COMPLAINT,
     canonical_content_type,
@@ -103,6 +103,26 @@ def complaint_create(request):
             )
 
             return redirect("complaints:complaint_create")
+
+        # SCMS-SR-007. Checked before the form is saved, so a
+        # throttled submission creates nothing.
+        if ratelimit.too_many_submissions(request.user):
+            messages.error(
+                request,
+                f"You have submitted "
+                f"{ratelimit.SUBMISSION_LIMIT} complaints in the last "
+                f"hour, which is the limit. Please try again later.",
+            )
+
+            return render(
+                request,
+                "complaints/complaint_form.html",
+                {
+                    "form": form,
+                    "draft": get_draft(request.user),
+                    "draft_days": DRAFT_RETENTION_DAYS,
+                },
+            )
 
         if form.is_valid():
             complaint = form.save(commit=False)

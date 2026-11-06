@@ -1,8 +1,8 @@
 {% extends "complaints/base.html" %}
 
 {% block content %}
-{# SCMS-F-026. The links carry the current query string, so an
-   export returns the rows on screen rather than everything. #}
+{% comment %} SCMS-F-026. The links carry the current query string, so an
+   export returns the rows on screen rather than everything. {% endcomment %}
 <p>
     <a class="button"
        href="{% url 'complaints:complaint_export' 'csv' %}?{{ request.GET.urlencode }}">
@@ -18,8 +18,8 @@
   <h1>Complaint queue</h1>
   <p>Showing complaints visible to your role.</p>
 
-  {# SCMS-F-028. Filters narrow what your role already allows; they
-     never widen it. #}
+  {% comment %} SCMS-F-028. Filters narrow what your role already allows; they
+     never widen it. {% endcomment %}
   <div class="card">
     <form method="get">
       {% for error in search.non_field_errors %}
@@ -71,8 +71,8 @@
           <td>{{ complaint.assigned_to|default:"Unassigned" }}</td>
           <td>{{ complaint.sla_due_at|date:"d M Y H:i"|default:"-" }}</td>
           <td>
-            {# Any staff member may move a complaint along; only a
-               Department Admin or System Admin may reassign it. #}
+            {% comment %} Any staff member may move a complaint along; only a
+               Department Admin or System Admin may reassign it. {% endcomment %}
             <a href="{% url 'complaints:complaint_status' complaint.reference_id %}">
               Status
             </a>
