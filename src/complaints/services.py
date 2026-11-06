@@ -2,11 +2,12 @@
 from datetime import timedelta
 
 from django.db import transaction
-from django.db.models import Avg, F, Q
+from django.db.models import Avg, Count, F, Q
 from django.utils import timezone
 
 from .models import (
     Complaint,
+    ComplaintPriority,
     ComplaintComment,
     ComplaintRating,
     ComplaintStatusHistory,
@@ -739,3 +740,114 @@ def close_expired_complaints(now=None):
         closed += 1
 
     return closed
+
+
+def visible_complaints(user):
+    """The complaints this staff user may see (SCMS-SR-003).
+
+    One definition, used by the queue, the dashboard and the
+    exports. Before this existed the queue scoped inline, and any
+    new page that reported on complaints would have had to repeat
+    the rule -- which is how a reporting page ends up showing a
+    department figures it should not see.
+
+    Returns an unordered queryset so callers can order it; every
+    caller does.
+    """
+    from .roles import Role, get_department, get_role
+
+    complaints = Complaint.objects.select_related(
+        "assigned_department",
+        "assigned_to",
+        "category",
+    )
+
+    role = get_role(user)
+
+    if role == Role.SUPPORT_AGENT:
+        return complaints.filter(assigned_to=user)
+
+    if role == Role.DEPARTMENT_ADMIN:
+        return complaints.filter(
+            assigned_department=get_department(user),
+        )
+
+    if role == Role.SYSTEM_ADMIN:
+        return complaints
+
+    # Deny by default: a role with no reporting rights sees nothing,
+    # rather than everything.
+    return complaints.none()
+
+
+def dashboard_figures(user, now=None):
+    """Counts and averages for the dashboard (SCMS-F-025).
+
+    Everything is derived from visible_complaints(), so the numbers
+    a user sees cover exactly the complaints they could open. A
+    dashboard that aggregates more widely than its viewer's access
+    leaks through the totals even when every page is locked.
+    """
+    moment = now or timezone.now()
+    scoped = visible_complaints(user)
+
+    open_statuses = [
+        status for status in Complaint.Status.values
+        if status != Complaint.Status.CLOSED
+    ]
+
+    by_status = {
+        row["status"]: row["count"]
+        for row in scoped.values("status").annotate(count=Count("id"))
+    }
+    by_priority = {
+        row["priority"]: row["count"]
+        for row in scoped.values("priority").annotate(count=Count("id"))
+    }
+    by_department = {
+        row["assigned_department__name"]: row["count"]
+        for row in (
+            scoped.values("assigned_department__name")
+            .annotate(count=Count("id"))
+            .order_by("assigned_department__name")
+        )
+    }
+
+    # A breach is a deadline that has passed on something still
+    # open. A closed complaint that was late is history, not a
+    # problem anyone can still act on.
+    breached = scoped.filter(
+        sla_due_at__lt=moment,
+        status__in=open_statuses,
+    ).count()
+
+    average = ComplaintRating.objects.filter(
+        complaint__in=scoped,
+    ).aggregate(average=Avg("score"))["average"]
+
+    labels = dict(Complaint.Status.choices)
+    priority_labels = dict(ComplaintPriority.choices)
+
+    return {
+        "total": scoped.count(),
+        "open_total": scoped.exclude(
+            status=Complaint.Status.CLOSED,
+        ).count(),
+        "by_status": {
+            labels.get(key, key): value
+            for key, value in sorted(by_status.items())
+        },
+        "by_priority": {
+            priority_labels.get(key, key): value
+            for key, value in sorted(by_priority.items())
+        },
+        "by_department": {
+            (name or "Unassigned"): value
+            for name, value in by_department.items()
+        },
+        "sla_breached": breached,
+        "average_rating": average,
+        "rating_count": ComplaintRating.objects.filter(
+            complaint__in=scoped,
+        ).count(),
+    }

@@ -24,6 +24,12 @@ urlpatterns = [
     path("", views.complaint_list, name="my_complaints"),
     path("new/", views.complaint_create, name="complaint_create"),
     path("queue/", views.department_queue, name="department_queue"),
+    path("dashboard/", views.dashboard, name="dashboard"),
+    path(
+        "export/<str:extension>/",
+        views.complaint_export,
+        name="complaint_export",
+    ),
     path(
         "<ref:reference_id>/",
         views.complaint_detail,

@@ -1,0 +1,95 @@
+{% extends "complaints/base.html" %}
+
+{% block title %}Dashboard | SCMS{% endblock %}
+
+{% block content %}
+{# SCMS-F-025. Every figure is derived from the same role-scoped
+   queryset as the queue, so the totals cover exactly the
+   complaints this user could open. #}
+<div class="card">
+    <h1>Dashboard</h1>
+    <p class="muted">
+        {% if role == "SUPPORT_AGENT" %}
+            Complaints assigned to you.
+        {% elif role == "DEPARTMENT_ADMIN" %}
+            Complaints in your department.
+        {% else %}
+            All complaints.
+        {% endif %}
+    </p>
+
+    <table>
+        <tr>
+            <th>Total</th>
+            <th>Still open</th>
+            <th>SLA breached</th>
+            <th>Average rating</th>
+        </tr>
+        <tr>
+            <td>{{ figures.total }}</td>
+            <td>{{ figures.open_total }}</td>
+            <td>{{ figures.sla_breached }}</td>
+            <td>
+                {% if figures.average_rating %}
+                    {{ figures.average_rating|floatformat:1 }} / 5
+                    <span class="muted">
+                        ({{ figures.rating_count }} rated)
+                    </span>
+                {% else %}
+                    <span class="muted">no ratings yet</span>
+                {% endif %}
+            </td>
+        </tr>
+    </table>
+</div>
+
+<div class="card">
+    <h2>By status</h2>
+    {% if figures.by_status %}
+        <table>
+            <tr><th>Status</th><th>Complaints</th></tr>
+            {% for label, count in figures.by_status.items %}
+                <tr><td>{{ label }}</td><td>{{ count }}</td></tr>
+            {% endfor %}
+        </table>
+    {% else %}
+        <p class="muted">Nothing to show yet.</p>
+    {% endif %}
+</div>
+
+<div class="card">
+    <h2>By priority</h2>
+    {% if figures.by_priority %}
+        <table>
+            <tr><th>Priority</th><th>Complaints</th></tr>
+            {% for label, count in figures.by_priority.items %}
+                <tr><td>{{ label }}</td><td>{{ count }}</td></tr>
+            {% endfor %}
+        </table>
+    {% else %}
+        <p class="muted">Nothing to show yet.</p>
+    {% endif %}
+</div>
+
+{% if role == "SYSTEM_ADMIN" %}
+<div class="card">
+    <h2>By department</h2>
+    {% if figures.by_department %}
+        <table>
+            <tr><th>Department</th><th>Complaints</th></tr>
+            {% for name, count in figures.by_department.items %}
+                <tr><td>{{ name }}</td><td>{{ count }}</td></tr>
+            {% endfor %}
+        </table>
+    {% else %}
+        <p class="muted">Nothing to show yet.</p>
+    {% endif %}
+</div>
+{% endif %}
+
+<p>
+    <a href="{% url 'complaints:department_queue' %}">
+        Open the complaint queue
+    </a>
+</p>
+{% endblock %}
