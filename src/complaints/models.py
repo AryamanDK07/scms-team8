@@ -625,3 +625,121 @@ def create_user_profile(sender, instance, created, **kwargs):
     """Give every new user a Complainant profile by default."""
     if created:
         UserProfile.objects.get_or_create(user=instance)
+
+
+class ComplaintDraft(models.Model):
+    """An unfinished complaint, kept for a limited time (SCMS-F-010).
+
+    A draft is deliberately NOT a Complaint with a "draft" status.
+    If it were, every queue, dashboard count, export and search
+    would have to remember to exclude it, and the first one that
+    forgot would publish something the complainant had not
+    submitted. A separate table cannot leak that way: nothing that
+    reports on complaints can see it at all.
+
+    It also has no reference ID, no SLA deadline and no department.
+    Those are consequences of lodging, and a draft has not been
+    lodged.
+
+    One draft per person, because the requirement is about
+    finishing the complaint you started rather than keeping a
+    folder of them.
+    """
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="complaint_draft",
+    )
+    title = models.CharField(max_length=200, blank=True)
+    description = models.TextField(max_length=2000, blank=True)
+    location = models.CharField(max_length=200, blank=True)
+    category = models.ForeignKey(
+        Category,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    sub_category = models.ForeignKey(
+        SubCategory,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-updated_at"]
+
+    def __str__(self):
+        return f"Draft by {self.user}: {self.title or '(untitled)'}"
+
+
+class DuplicateVerdict(models.TextChoices):
+    PENDING = "PENDING", "Awaiting review"
+    CONFIRMED = "CONFIRMED", "Confirmed duplicate"
+    DISMISSED = "DISMISSED", "Not a duplicate"
+
+
+class DuplicateFlag(models.Model):
+    """A suspected duplicate, for an agent to judge (SCMS-F-015).
+
+    The flag is a suggestion, never an action. Nothing is merged,
+    closed or hidden because of it: the requirement says the agent
+    may confirm or dismiss, so the system's job is to raise the
+    question and record the answer.
+    """
+
+    complaint = models.ForeignKey(
+        Complaint,
+        on_delete=models.PROTECT,
+        related_name="duplicate_flags",
+    )
+    similar_to = models.ForeignKey(
+        Complaint,
+        on_delete=models.PROTECT,
+        related_name="flagged_as_original_for",
+    )
+    similarity = models.FloatField(
+        help_text="Description similarity, 0.0 to 1.0.",
+    )
+    verdict = models.CharField(
+        max_length=20,
+        choices=DuplicateVerdict.choices,
+        default=DuplicateVerdict.PENDING,
+    )
+    reviewed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="duplicate_reviews",
+    )
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-similarity"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["complaint", "similar_to"],
+                name="one_flag_per_pair",
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"{self.complaint.reference_id} ~ "
+            f"{self.similar_to.reference_id} "
+            f"({self.similarity:.0%})"
+        )
+
+    @property
+    def percentage(self):
+        """Similarity as a whole number, for display.
+
+        The template cannot turn 0.85 into 85 without a filter that
+        reads as arithmetic, so the model does it once.
+        """
+        return round(self.similarity * 100)

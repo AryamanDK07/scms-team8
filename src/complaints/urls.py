@@ -23,6 +23,12 @@ app_name = "complaints"
 urlpatterns = [
     path("", views.complaint_list, name="my_complaints"),
     path("new/", views.complaint_create, name="complaint_create"),
+    path("new/discard/", views.draft_discard, name="draft_discard"),
+    path(
+        "duplicates/<int:pk>/",
+        views.duplicate_flag_resolve,
+        name="duplicate_flag_resolve",
+    ),
     path("queue/", views.department_queue, name="department_queue"),
     path("dashboard/", views.dashboard, name="dashboard"),
     path(

@@ -27,9 +27,12 @@ from .models import (
     Complaint,
     ComplaintAttachment,
     ComplaintComment,
+    ComplaintDraft,
     ComplaintRating,
     ComplaintStatusHistory,
     Department,
+    DuplicateFlag,
+    DuplicateVerdict,
     SecurityEvent,
     SecurityEventType,
     SubCategory,
@@ -45,6 +48,10 @@ from .services import (
     can_reopen,
     close_expired_complaints,
     dashboard_figures,
+    DUPLICATE_THRESHOLD,
+    DUPLICATE_WINDOW_DAYS,
+    flag_duplicates,
+    get_draft,
     comment_thread,
     department_average_rating,
     may_reopen,
@@ -52,8 +59,11 @@ from .services import (
     offerable_transitions,
     override_priority,
     priority_for,
+    purge_expired_drafts,
     rate_complaint,
     reopen_complaint,
+    resolve_duplicate_flag,
+    save_draft,
     REOPEN_WINDOW_DAYS,
     RESOLUTION_REMARKS_MIN,
     resolve_complaint,
@@ -3264,6 +3274,277 @@ class ObjectLevelAccessTests(RoleFixture):
         orphan.profile.delete()
         orphan.refresh_from_db()
         self.assertFalse(can_view_complaint(orphan, self.complaint))
+
+
+class DraftTests(BaseFixture):
+    """SCMS-F-010 / TC-Lodge-05: save, resume, and purge at 7 days."""
+
+    URL = "/new/"
+
+    def setUp(self):
+        super().setUp()
+        self.sub_category = SubCategory.objects.create(
+            name="Projector", code="projector", category=self.category,
+        )
+        self.client.force_login(self.user)
+
+    def save_draft_via_form(self, **overrides):
+        data = {
+            "title": "Projector flickers",
+            "description": "It flickers every few minutes.",
+            "location": "Room 302",
+            "category": str(self.category.pk),
+            "save_draft": "1",
+        }
+        data.update(overrides)
+
+        return self.client.post(self.URL, data)
+
+    def test_a_draft_is_saved_without_passing_validation(self):
+        """A draft is unfinished by definition."""
+        response = self.save_draft_via_form(
+            description="", location="", category="",
+        )
+
+        self.assertEqual(response.status_code, 302)
+
+        draft = ComplaintDraft.objects.get(user=self.user)
+        self.assertEqual(draft.title, "Projector flickers")
+        self.assertEqual(Complaint.objects.count(), 0)
+
+    def test_the_draft_is_filled_back_into_the_form(self):
+        self.save_draft_via_form()
+
+        page = self.client.get(self.URL)
+
+        self.assertContains(page, "Projector flickers")
+        self.assertContains(page, "Unfinished draft")
+
+    def test_saving_again_replaces_the_draft(self):
+        """One draft per person, not a folder of them."""
+        self.save_draft_via_form()
+        self.save_draft_via_form(title="Projector dead")
+
+        self.assertEqual(ComplaintDraft.objects.count(), 1)
+        self.assertEqual(
+            ComplaintDraft.objects.get().title, "Projector dead",
+        )
+
+    def test_a_draft_is_retrievable_before_seven_days(self):
+        draft = save_draft(self.user, title="Still here")
+        ComplaintDraft.objects.filter(pk=draft.pk).update(
+            updated_at=timezone.now() - timedelta(days=6),
+        )
+
+        self.assertEqual(purge_expired_drafts(), 0)
+        self.assertIsNotNone(get_draft(self.user))
+
+    def test_a_draft_is_gone_after_seven_days(self):
+        draft = save_draft(self.user, title="Too old")
+        ComplaintDraft.objects.filter(pk=draft.pk).update(
+            updated_at=timezone.now() - timedelta(days=8),
+        )
+
+        self.assertEqual(purge_expired_drafts(), 1)
+        self.assertIsNone(get_draft(self.user))
+
+    def test_the_window_runs_from_the_last_save(self):
+        """Editing yesterday must not expire because you began on day 1."""
+        draft = save_draft(self.user, title="Started long ago")
+        ComplaintDraft.objects.filter(pk=draft.pk).update(
+            created_at=timezone.now() - timedelta(days=30),
+            updated_at=timezone.now() - timedelta(days=1),
+        )
+
+        self.assertEqual(purge_expired_drafts(), 0)
+
+    def test_submitting_the_complaint_clears_the_draft(self):
+        self.save_draft_via_form()
+
+        self.client.post(self.URL, {
+            "title": "Projector flickers",
+            "description": "It flickers every few minutes.",
+            "location": "Room 302",
+            "category": str(self.category.pk),
+            "sub_category": str(self.sub_category.pk),
+        })
+
+        self.assertEqual(Complaint.objects.count(), 1)
+        self.assertIsNone(get_draft(self.user))
+
+    def test_a_draft_can_be_discarded(self):
+        self.save_draft_via_form()
+
+        self.client.post("/new/discard/")
+
+        self.assertIsNone(get_draft(self.user))
+
+    def test_a_draft_is_invisible_to_every_complaint_query(self):
+        """Why a draft is not a Complaint with a 'draft' status."""
+        self.save_draft_via_form()
+
+        self.assertEqual(Complaint.objects.count(), 0)
+
+    def test_the_purge_command_runs(self):
+        from io import StringIO
+        from django.core.management import call_command
+
+        draft = save_draft(self.user, title="Old")
+        ComplaintDraft.objects.filter(pk=draft.pk).update(
+            updated_at=timezone.now() - timedelta(days=9),
+        )
+        out = StringIO()
+
+        call_command("purge_expired_drafts", stdout=out)
+
+        self.assertIn("1 draft(s) purged", out.getvalue())
+
+
+class DuplicateDetectionTests(BaseFixture):
+    """SCMS-F-015 / TC-Route-05: flag, then let an agent judge."""
+
+    TEXT = (
+        "The projector in room 302 does not switch on at all. "
+        "I have tried both wall sockets and the remote."
+    )
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.first = self.make_complaint(description=self.TEXT)
+        self.agent = get_user_model().objects.create_user(
+            username="dupagent", password="not-a-real-password",
+        )
+        profile = self.agent.profile
+        profile.role = Role.SUPPORT_AGENT
+        profile.department = self.department
+        profile.save()
+
+    def lodge_similar(self, text=None, **overrides):
+        return self.make_complaint(
+            description=text if text is not None else self.TEXT,
+            **overrides,
+        )
+
+    def test_a_near_identical_complaint_is_flagged(self):
+        second = self.lodge_similar(self.TEXT + " Still broken.")
+
+        flags = flag_duplicates(second)
+
+        self.assertEqual(len(flags), 1)
+        self.assertEqual(flags[0].similar_to, self.first)
+        self.assertGreaterEqual(flags[0].similarity, DUPLICATE_THRESHOLD)
+
+    def test_an_unrelated_complaint_is_not_flagged(self):
+        second = self.lodge_similar(
+            "The lift on the north side is making a grinding noise.",
+        )
+
+        self.assertEqual(flag_duplicates(second), [])
+
+    def test_case_and_spacing_do_not_defeat_the_match(self):
+        second = self.lodge_similar(f"  {self.TEXT.upper()}  ")
+
+        self.assertEqual(len(flag_duplicates(second)), 1)
+
+    def test_another_complainants_identical_text_is_not_a_duplicate(self):
+        """Two people can report the same broken projector."""
+        other = get_user_model().objects.create_user(
+            username="someone", password="not-a-real-password",
+        )
+        second = self.lodge_similar(submitted_by=other)
+
+        self.assertEqual(flag_duplicates(second), [])
+
+    def test_a_different_category_is_not_a_duplicate(self):
+        other_category = Category.objects.create(
+            name="Facilities", code="fac2",
+            department=self.department, sla_hours=24,
+        )
+        second = self.lodge_similar(category=other_category)
+
+        self.assertEqual(flag_duplicates(second), [])
+
+    def test_an_older_complaint_falls_outside_the_window(self):
+        Complaint.objects.filter(pk=self.first.pk).update(
+            created_at=timezone.now() - timedelta(
+                days=DUPLICATE_WINDOW_DAYS + 1,
+            ),
+        )
+        second = self.lodge_similar()
+
+        self.assertEqual(flag_duplicates(second), [])
+
+    def test_flagging_twice_does_not_duplicate_the_flag(self):
+        second = self.lodge_similar()
+
+        flag_duplicates(second)
+        flag_duplicates(second)
+
+        self.assertEqual(
+            DuplicateFlag.objects.filter(complaint=second).count(), 1,
+        )
+
+    def test_nothing_is_closed_or_merged_by_a_flag(self):
+        """The flag asks a question; it does not act."""
+        second = self.lodge_similar()
+        flag_duplicates(second)
+
+        second.refresh_from_db()
+        self.first.refresh_from_db()
+
+        self.assertEqual(second.status, Complaint.Status.OPEN)
+        self.assertEqual(self.first.status, Complaint.Status.OPEN)
+
+    def test_an_agent_can_confirm_a_flag(self):
+        second = self.lodge_similar()
+        second.assigned_to = self.agent
+        second.assigned_department = self.department
+        second.save(update_fields=["assigned_to", "assigned_department"])
+        flag = flag_duplicates(second)[0]
+
+        self.client.force_login(self.agent)
+        self.client.post(f"/duplicates/{flag.pk}/", {"verdict": "confirm"})
+
+        flag.refresh_from_db()
+        self.assertEqual(flag.verdict, DuplicateVerdict.CONFIRMED)
+        self.assertEqual(flag.reviewed_by, self.agent)
+        self.assertIsNotNone(flag.reviewed_at)
+
+    def test_an_agent_can_dismiss_a_flag(self):
+        second = self.lodge_similar()
+        second.assigned_to = self.agent
+        second.assigned_department = self.department
+        second.save(update_fields=["assigned_to", "assigned_department"])
+        flag = flag_duplicates(second)[0]
+
+        self.client.force_login(self.agent)
+        self.client.post(f"/duplicates/{flag.pk}/", {"verdict": "dismiss"})
+
+        flag.refresh_from_db()
+        self.assertEqual(flag.verdict, DuplicateVerdict.DISMISSED)
+
+    def test_a_flag_cannot_be_judged_twice(self):
+        second = self.lodge_similar()
+        flag = flag_duplicates(second)[0]
+        resolve_duplicate_flag(flag, actor=self.agent, confirmed=True)
+
+        with self.assertRaises(ValueError):
+            resolve_duplicate_flag(flag, actor=self.agent, confirmed=False)
+
+    def test_a_complainant_cannot_judge_a_flag(self):
+        second = self.lodge_similar()
+        flag = flag_duplicates(second)[0]
+
+        self.client.force_login(self.user)
+        response = self.client.post(
+            f"/duplicates/{flag.pk}/", {"verdict": "dismiss"},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        flag.refresh_from_db()
+        self.assertEqual(flag.verdict, DuplicateVerdict.PENDING)
 
 
 class DashboardTests(RoleFixture):

@@ -1,5 +1,6 @@
 
 from datetime import timedelta
+from difflib import SequenceMatcher
 
 from django.db import transaction
 from django.db.models import Avg, Count, F, Q
@@ -7,10 +8,13 @@ from django.utils import timezone
 
 from .models import (
     Complaint,
+    ComplaintDraft,
     ComplaintPriority,
     ComplaintComment,
     ComplaintRating,
     ComplaintStatusHistory,
+    DuplicateFlag,
+    DuplicateVerdict,
     ReferenceSequence,
 )
 
@@ -851,3 +855,142 @@ def dashboard_figures(user, now=None):
             complaint__in=scoped,
         ).count(),
     }
+
+
+# How long an unfinished draft is kept (SCMS-F-010).
+DRAFT_RETENTION_DAYS = 7
+
+# A complaint is a suspected duplicate of another by the same
+# complainant, in the same category, within this many days
+# (SCMS-F-015).
+DUPLICATE_WINDOW_DAYS = 30
+
+# Description similarity at or above which the pair is flagged.
+DUPLICATE_THRESHOLD = 0.70
+
+
+def save_draft(user, **fields):
+    """Create or update this user's draft (SCMS-F-010).
+
+    The retention window runs from the last save, not the first:
+    updated_at is what auto_now keeps, and a draft someone edited
+    yesterday should not vanish because they began it eight days
+    ago.
+    """
+    draft, _ = ComplaintDraft.objects.update_or_create(
+        user=user, defaults=fields,
+    )
+
+    return draft
+
+
+def get_draft(user):
+    """This user's draft, or None."""
+    return ComplaintDraft.objects.filter(user=user).first()
+
+
+def purge_expired_drafts(now=None):
+    """Delete drafts untouched for DRAFT_RETENTION_DAYS.
+
+    Returns the number deleted. Like close_expired_complaints,
+    this is invoked by a management command; scheduling it is
+    deployment configuration.
+    """
+    moment = now or timezone.now()
+    cutoff = moment - timedelta(days=DRAFT_RETENTION_DAYS)
+
+    deleted, _ = ComplaintDraft.objects.filter(
+        updated_at__lte=cutoff,
+    ).delete()
+
+    return deleted
+
+
+def description_similarity(first, second):
+    """How alike two descriptions are, from 0.0 to 1.0.
+
+    difflib rather than anything cleverer. SCMS-F-015 asks for a
+    similarity figure and a threshold, not for semantic matching,
+    and a ratio a reader can reproduce by hand is easier to defend
+    than a score out of a model nobody can inspect.
+
+    Case and surrounding whitespace are ignored, so the same text
+    retyped in a different case still matches.
+    """
+    return SequenceMatcher(
+        None,
+        (first or "").strip().lower(),
+        (second or "").strip().lower(),
+    ).ratio()
+
+
+def find_duplicates(complaint, now=None):
+    """Earlier complaints this one may duplicate (SCMS-F-015).
+
+    Same complainant, same category, within the window, ordered
+    most similar first. Returns (complaint, similarity) pairs.
+    """
+    moment = now or timezone.now()
+    cutoff = moment - timedelta(days=DUPLICATE_WINDOW_DAYS)
+
+    candidates = (
+        Complaint.objects
+        .filter(
+            submitted_by_id=complaint.submitted_by_id,
+            category_id=complaint.category_id,
+            created_at__gte=cutoff,
+        )
+        .exclude(pk=complaint.pk)
+    )
+
+    matches = [
+        (other, description_similarity(
+            complaint.description, other.description,
+        ))
+        for other in candidates
+    ]
+
+    return sorted(
+        [pair for pair in matches if pair[1] >= DUPLICATE_THRESHOLD],
+        key=lambda pair: pair[1],
+        reverse=True,
+    )
+
+
+def flag_duplicates(complaint, now=None):
+    """Record a flag for each suspected duplicate. Returns them.
+
+    Nothing is merged, closed or hidden: the flag asks a question
+    and an agent answers it. Acting automatically on a 70% text
+    match would close real complaints that happen to be worded
+    alike.
+    """
+    flags = []
+
+    for other, similarity in find_duplicates(complaint, now=now):
+        flag, created = DuplicateFlag.objects.get_or_create(
+            complaint=complaint,
+            similar_to=other,
+            defaults={"similarity": similarity},
+        )
+
+        if created:
+            flags.append(flag)
+
+    return flags
+
+
+def resolve_duplicate_flag(flag, actor, confirmed):
+    """Record an agent's verdict on a suspected duplicate."""
+    if flag.verdict != DuplicateVerdict.PENDING:
+        raise ValueError("This flag has already been reviewed.")
+
+    flag.verdict = (
+        DuplicateVerdict.CONFIRMED if confirmed
+        else DuplicateVerdict.DISMISSED
+    )
+    flag.reviewed_by = actor
+    flag.reviewed_at = timezone.now()
+    flag.save(update_fields=["verdict", "reviewed_by", "reviewed_at"])
+
+    return flag

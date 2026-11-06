@@ -81,6 +81,43 @@
 </div>
 {% endif %}
 
+{# SCMS-F-015. A suggestion for the agent, never an action: nothing
+   is merged or closed because of a flag. #}
+{% if duplicate_flags and can_work %}
+<div class="card">
+    <h2>Possible duplicate</h2>
+    {% for flag in duplicate_flags %}
+        <p>
+            Similar to
+            <a href="{% url 'complaints:complaint_detail' flag.similar_to.reference_id %}">
+                {{ flag.similar_to.reference_id }}
+            </a>
+            &mdash; {{ flag.percentage }}% alike,
+            lodged {{ flag.similar_to.created_at|date:"d M Y" }}.
+        </p>
+
+        {% if flag.verdict == "PENDING" %}
+            <form method="post"
+                  action="{% url 'complaints:duplicate_flag_resolve' flag.pk %}">
+                {% csrf_token %}
+                <button type="submit" name="verdict" value="confirm"
+                        class="button">Confirm duplicate</button>
+                <button type="submit" name="verdict" value="dismiss"
+                        class="button">Not a duplicate</button>
+            </form>
+        {% else %}
+            <p class="muted">
+                {{ flag.get_verdict_display }}
+                {% if flag.reviewed_by %}
+                    by {{ flag.reviewed_by }}
+                {% endif %}
+                on {{ flag.reviewed_at|date:"d M Y, H:i" }}.
+            </p>
+        {% endif %}
+    {% endfor %}
+</div>
+{% endif %}
+
 {# SCMS-F-019. The complainant's one chance to say the fix did not
    work, offered only while the window is open. #}
 {% if can_reopen %}
