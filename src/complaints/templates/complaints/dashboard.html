@@ -3,9 +3,9 @@
 {% block title %}Dashboard | SCMS{% endblock %}
 
 {% block content %}
-{# SCMS-F-025. Every figure is derived from the same role-scoped
+{% comment %} SCMS-F-025. Every figure is derived from the same role-scoped
    queryset as the queue, so the totals cover exactly the
-   complaints this user could open. #}
+   complaints this user could open. {% endcomment %}
 <div class="card">
     <h1>Dashboard</h1>
     <p class="muted">

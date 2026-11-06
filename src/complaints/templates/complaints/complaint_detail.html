@@ -22,8 +22,8 @@
     </p>
 
     <p>
-        {# category is a ForeignKey, so there is no
-           get_category_display: that rendered blank. #}
+        {% comment %} category is a ForeignKey, so there is no
+           get_category_display: that rendered blank. {% endcomment %}
         <strong>Category:</strong>
         {{ complaint.category.name }}
     </p>
@@ -81,8 +81,8 @@
 </div>
 {% endif %}
 
-{# SCMS-F-015. A suggestion for the agent, never an action: nothing
-   is merged or closed because of a flag. #}
+{% comment %} SCMS-F-015. A suggestion for the agent, never an action: nothing
+   is merged or closed because of a flag. {% endcomment %}
 {% if duplicate_flags and can_work %}
 <div class="card">
     <h2>Possible duplicate</h2>
@@ -118,8 +118,8 @@
 </div>
 {% endif %}
 
-{# SCMS-F-019. The complainant's one chance to say the fix did not
-   work, offered only while the window is open. #}
+{% comment %} SCMS-F-019. The complainant's one chance to say the fix did not
+   work, offered only while the window is open. {% endcomment %}
 {% if can_reopen %}
 <div class="card">
     <h2>Not fixed?</h2>
@@ -149,8 +149,8 @@
 </div>
 {% endif %}
 
-{# SCMS-F-020. Shown once the complaint is closed: either the
-   rating already given, or the form, to the complainant alone. #}
+{% comment %} SCMS-F-020. Shown once the complaint is closed: either the
+   rating already given, or the form, to the complainant alone. {% endcomment %}
 {% if complaint.rating %}
 <div class="card">
     <h2>Your rating</h2>
@@ -206,8 +206,8 @@
 <div class="card">
     <h2>Evidence</h2>
 
-    {# SCMS-F-008. Links go through an access-checked view, not
-       straight at the stored file. #}
+    {% comment %} SCMS-F-008. Links go through an access-checked view, not
+       straight at the stored file. {% endcomment %}
     {% if complaint.attachments.all %}
         <ul>
             {% for attachment in complaint.attachments.all %}
@@ -239,8 +239,8 @@
 <div class="card">
     <h2>Conversation</h2>
 
-    {# SCMS-F-017. Visible to the complainant and the assigned
-       agent, and to no other complainant. #}
+    {% comment %} SCMS-F-017. Visible to the complainant and the assigned
+       agent, and to no other complainant. {% endcomment %}
     {% for comment in thread %}
         <div style="padding:12px 0; border-bottom:1px solid #e3e8ef">
             <strong>{{ comment.author }}</strong>
