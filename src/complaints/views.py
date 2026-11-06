@@ -25,11 +25,17 @@ from .forms import (
 )
 from .models import (
     Complaint,
+    ComplaintDraft,
     ComplaintAttachment,
     ComplaintComment,
     ComplaintStatusHistory,
+    DuplicateFlag,
 )
-from .permissions import require_complaint_access, role_required
+from .permissions import (
+    can_work_complaint,
+    require_complaint_access,
+    role_required,
+)
 from .roles import Role, STAFF_ROLES, get_role
 from .services import (
     add_comment,
@@ -39,12 +45,17 @@ from .services import (
     can_rate,
     comment_thread,
     dashboard_figures,
+    DRAFT_RETENTION_DAYS,
+    flag_duplicates,
+    get_draft,
     offerable_transitions,
     override_priority,
     may_reopen,
     priority_for,
     rate_complaint,
+    resolve_duplicate_flag,
     reopen_complaint,
+    save_draft,
     resolve_complaint,
     transition_status,
     visible_complaints,
@@ -71,6 +82,27 @@ def complaint_list(request):
 def complaint_create(request):
     if request.method == "POST":
         form = ComplaintForm(request.POST)
+
+        # SCMS-F-010. Saving a draft deliberately skips validation:
+        # a draft is unfinished by definition, and refusing to keep
+        # it because a field is missing defeats the point.
+        if "save_draft" in request.POST:
+            save_draft(
+                request.user,
+                title=request.POST.get("title", "")[:200],
+                description=request.POST.get("description", "")[:2000],
+                location=request.POST.get("location", "")[:200],
+                category_id=request.POST.get("category") or None,
+                sub_category_id=request.POST.get("sub_category") or None,
+            )
+
+            messages.success(
+                request,
+                f"Draft saved. It will be kept for "
+                f"{DRAFT_RETENTION_DAYS} days.",
+            )
+
+            return redirect("complaints:complaint_create")
 
         if form.is_valid():
             complaint = form.save(commit=False)
@@ -126,17 +158,84 @@ def complaint_create(request):
                     "assign it.",
                 )
 
+            # SCMS-F-015. Flagged after the complaint exists, so a
+            # suspected duplicate is recorded against a real
+            # reference rather than guessed at before submission.
+            flagged = flag_duplicates(complaint)
+
+            if flagged:
+                messages.warning(
+                    request,
+                    f"This looks similar to {len(flagged)} complaint(s) "
+                    f"you lodged recently. An agent will check whether "
+                    f"it is a duplicate.",
+                )
+
+            # The draft has become a complaint, so it is no longer a
+            # draft. Leaving it would offer the complainant their own
+            # submitted text back as unfinished work.
+            ComplaintDraft.objects.filter(user=request.user).delete()
+
             return redirect(
                 "complaints:complaint_detail",
                 reference_id=complaint.reference_id,
             )
     else:
-        form = ComplaintForm()
+        draft = get_draft(request.user)
+
+        form = ComplaintForm(initial={
+            "title": draft.title,
+            "description": draft.description,
+            "location": draft.location,
+            "category": draft.category_id,
+            "sub_category": draft.sub_category_id,
+        }) if draft else ComplaintForm()
 
     return render(
         request,
         "complaints/complaint_form.html",
-        {"form": form},
+        {
+            "form": form,
+            "draft": get_draft(request.user),
+            "draft_days": DRAFT_RETENTION_DAYS,
+        },
+    )
+
+
+@role_required(Role.COMPLAINANT)
+def draft_discard(request):
+    """Throw away the saved draft (SCMS-F-010)."""
+    if request.method == "POST":
+        ComplaintDraft.objects.filter(user=request.user).delete()
+        messages.success(request, "Draft discarded.")
+
+    return redirect("complaints:complaint_create")
+
+
+@role_required(*STAFF_ROLES)
+def duplicate_flag_resolve(request, pk):
+    """Confirm or dismiss a suspected duplicate (SCMS-F-015)."""
+    flag = get_object_or_404(DuplicateFlag, pk=pk)
+
+    require_complaint_access(flag.complaint, request.user, write=True)
+
+    if request.method == "POST":
+        try:
+            resolve_duplicate_flag(
+                flag,
+                actor=request.user,
+                confirmed=request.POST.get("verdict") == "confirm",
+            )
+        except ValueError as problem:
+            messages.error(request, str(problem))
+        else:
+            messages.success(
+                request, f"Recorded: {flag.get_verdict_display()}.",
+            )
+
+    return redirect(
+        "complaints:complaint_detail",
+        reference_id=flag.complaint.reference_id,
     )
 
 
@@ -171,6 +270,10 @@ def complaint_detail(request, reference_id):
             "can_rate": can_rate(complaint, request.user),
             "reopen_form": ReopenForm(),
             "can_reopen": may_reopen(complaint, request.user),
+            "duplicate_flags": complaint.duplicate_flags.select_related(
+                "similar_to", "reviewed_by",
+            ).all(),
+            "can_work": can_work_complaint(request.user, complaint),
         },
     )
 
@@ -236,6 +339,10 @@ def complaint_comment_add(request, reference_id):
             "can_rate": can_rate(complaint, request.user),
             "reopen_form": ReopenForm(),
             "can_reopen": may_reopen(complaint, request.user),
+            "duplicate_flags": complaint.duplicate_flags.select_related(
+                "similar_to", "reviewed_by",
+            ).all(),
+            "can_work": can_work_complaint(request.user, complaint),
         },
     )
 
@@ -614,6 +721,10 @@ def complaint_rate(request, reference_id):
             "can_rate": can_rate(complaint, request.user),
             "reopen_form": ReopenForm(),
             "can_reopen": may_reopen(complaint, request.user),
+            "duplicate_flags": complaint.duplicate_flags.select_related(
+                "similar_to", "reviewed_by",
+            ).all(),
+            "can_work": can_work_complaint(request.user, complaint),
         },
     )
 
