@@ -14,6 +14,7 @@ from .forms import (
     ComplaintForm,
     ComplaintSearchForm,
     PriorityOverrideForm,
+    RatingForm,
     ResolutionForm,
     StatusChangeForm,
 )
@@ -30,10 +31,12 @@ from .services import (
     allowed_transitions,
     apply_complaint_filters,
     assign_complaint,
+    can_rate,
     comment_thread,
     offerable_transitions,
     override_priority,
     priority_for,
+    rate_complaint,
     resolve_complaint,
     transition_status,
 )
@@ -155,6 +158,8 @@ def complaint_detail(request, reference_id):
             "history": history,
             "thread": comment_thread(complaint),
             "comment_form": CommentForm(),
+            "rating_form": RatingForm(),
+            "can_rate": can_rate(complaint, request.user),
         },
     )
 
@@ -216,6 +221,8 @@ def complaint_comment_add(request, reference_id):
             "history": history,
             "thread": comment_thread(complaint),
             "comment_form": form,
+            "rating_form": RatingForm(),
+            "can_rate": can_rate(complaint, request.user),
         },
     )
 
@@ -562,5 +569,58 @@ def department_queue(request):
             "can_assign": role in (
                 Role.DEPARTMENT_ADMIN, Role.SYSTEM_ADMIN,
             ),
+        },
+    )
+
+
+@login_required
+def complaint_rate(request, reference_id):
+    """Record the complainant's rating of a closed complaint.
+
+    SCMS-F-020. Access follows the complaint, and rate_complaint
+    then decides whether this particular user may rate it now --
+    the view does not duplicate that rule, so the view and any
+    other caller cannot drift apart on who may rate what.
+    """
+    complaint = get_object_or_404(Complaint, reference_id=reference_id)
+
+    require_complaint_access(complaint, request.user)
+
+    if request.method != "POST":
+        return redirect(
+            "complaints:complaint_detail",
+            reference_id=complaint.reference_id,
+        )
+
+    form = RatingForm(request.POST)
+
+    if form.is_valid():
+        try:
+            rate_complaint(
+                complaint,
+                actor=request.user,
+                score=form.cleaned_data["score"],
+                comment=form.cleaned_data["comment"],
+            )
+        except ValueError as error:
+            form.add_error(None, str(error))
+        else:
+            return redirect(
+                "complaints:complaint_detail",
+                reference_id=complaint.reference_id,
+            )
+
+    history = complaint.status_history.select_related("changed_by").all()
+
+    return render(
+        request,
+        "complaints/complaint_detail.html",
+        {
+            "complaint": complaint,
+            "history": history,
+            "thread": comment_thread(complaint),
+            "comment_form": CommentForm(),
+            "rating_form": form,
+            "can_rate": can_rate(complaint, request.user),
         },
     )

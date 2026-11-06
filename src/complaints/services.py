@@ -2,12 +2,13 @@
 from datetime import timedelta
 
 from django.db import transaction
-from django.db.models import F, Q
+from django.db.models import Avg, F, Q
 from django.utils import timezone
 
 from .models import (
     Complaint,
     ComplaintComment,
+    ComplaintRating,
     ComplaintStatusHistory,
     ReferenceSequence,
 )
@@ -523,3 +524,84 @@ def can_reopen(complaint, now=None):
     deadline = complaint.resolved_at + timedelta(days=REOPEN_WINDOW_DAYS)
 
     return moment <= deadline
+
+
+def can_rate(complaint, user):
+    """Whether this user may rate this complaint now (SCMS-F-020).
+
+    The complainant who lodged it, once it is closed, and only if
+    nobody has rated it yet. Staff do not rate their own work.
+    """
+    if complaint.status != Complaint.Status.CLOSED:
+        return False
+
+    if complaint.submitted_by_id != getattr(user, "id", None):
+        return False
+
+    return not ComplaintRating.objects.filter(complaint=complaint).exists()
+
+
+def rate_complaint(complaint, actor, score, comment=""):
+    """Record the complainant's rating of a closed complaint.
+
+    SCMS-F-020. Raises ValueError with a reason the caller can show,
+    rather than returning None, so a refusal cannot be mistaken for
+    a successful rating of zero.
+    """
+    if complaint.status != Complaint.Status.CLOSED:
+        raise ValueError(
+            "A complaint can only be rated once it is closed."
+        )
+
+    if complaint.submitted_by_id != getattr(actor, "id", None):
+        raise ValueError(
+            "Only the person who lodged a complaint can rate it."
+        )
+
+    if not isinstance(score, int) or not (
+        ComplaintRating.MINIMUM <= score <= ComplaintRating.MAXIMUM
+    ):
+        raise ValueError(
+            f"The rating must be a whole number from "
+            f"{ComplaintRating.MINIMUM} to {ComplaintRating.MAXIMUM}."
+        )
+
+    # get_or_create rather than create, so two submissions racing --
+    # a double-clicked button is the usual cause -- leave one rating
+    # and a clear refusal, not an IntegrityError page.
+    with transaction.atomic():
+        rating, created = ComplaintRating.objects.get_or_create(
+            complaint=complaint,
+            defaults={
+                "score": score,
+                "comment": (comment or "").strip(),
+                "rated_by": actor,
+            },
+        )
+
+    if not created:
+        raise ValueError(
+            "This complaint has already been rated."
+        )
+
+    return rating
+
+
+def department_average_rating(department):
+    """Mean satisfaction score for a department, or None.
+
+    SCMS-F-020 asks for this to appear on the department dashboard,
+    which is T8-32. The aggregate lives here so the dashboard reads
+    one definition rather than inventing its own, and so this
+    requirement can be tested before that page exists.
+
+    None, not zero, when a department has no ratings yet: zero is a
+    score somebody could have given, and showing it would report
+    the worst possible satisfaction for a department nobody has
+    rated.
+    """
+    result = ComplaintRating.objects.filter(
+        complaint__assigned_department=department,
+    ).aggregate(average=Avg("score"))
+
+    return result["average"]

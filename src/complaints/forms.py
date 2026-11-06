@@ -513,3 +513,32 @@ class ComplaintForm(forms.ModelForm):
             )
 
         return cleaned
+
+
+class RatingForm(forms.Form):
+    """Rate a closed complaint from 1 to 5 (SCMS-F-020).
+
+    A select rather than a free number field: the scale is fixed at
+    1 to 5, and a text box invites a 7 that then has to be refused.
+    """
+
+    score = forms.TypedChoiceField(
+        choices=[
+            (5, "5 - Excellent"),
+            (4, "4 - Good"),
+            (3, "3 - Acceptable"),
+            (2, "2 - Poor"),
+            (1, "1 - Very poor"),
+        ],
+        coerce=int,
+        label="Rating",
+    )
+    comment = forms.CharField(
+        required=False,
+        max_length=1000,
+        widget=forms.Textarea(attrs={
+            "rows": 3,
+            "placeholder": "Anything you would like to add (optional).",
+        }),
+        label="Comment",
+    )

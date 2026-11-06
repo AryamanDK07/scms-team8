@@ -25,6 +25,7 @@ from .models import (
     Complaint,
     ComplaintAttachment,
     ComplaintComment,
+    ComplaintRating,
     ComplaintStatusHistory,
     Department,
     SecurityEvent,
@@ -40,10 +41,12 @@ from .services import (
     calculate_sla_deadline,
     can_reopen,
     comment_thread,
+    department_average_rating,
     eligible_agents,
     offerable_transitions,
     override_priority,
     priority_for,
+    rate_complaint,
     RESOLUTION_REMARKS_MIN,
     resolve_complaint,
     transition_status,
@@ -3254,6 +3257,188 @@ class ObjectLevelAccessTests(RoleFixture):
         self.assertFalse(can_view_complaint(orphan, self.complaint))
 
 
+class RatingTests(BaseFixture):
+    """SCMS-F-020 / TC-Res-03: a 1-to-5 rating on closure."""
+
+    def setUp(self):
+        super().setUp()
+        self.complaint = self.make_complaint(
+            assigned_department=self.department,
+        )
+        self.agent = get_user_model().objects.create_user(
+            username="agent", password="not-a-real-password",
+        )
+        self.client.force_login(self.user)
+
+    def close(self, complaint=None):
+        target = complaint or self.complaint
+        target.status = Complaint.Status.CLOSED
+        target.save(update_fields=["status"])
+
+        return target
+
+    def rate(self, score=5, comment="", complaint=None):
+        target = complaint or self.complaint
+
+        return self.client.post(
+            f"/{target.reference_id}/rate/",
+            {"score": str(score), "comment": comment},
+        )
+
+    def test_the_complainant_can_rate_a_closed_complaint(self):
+        self.close()
+
+        response = self.rate(4, "Sorted quickly, thank you.")
+
+        self.assertEqual(response.status_code, 302)
+
+        rating = ComplaintRating.objects.get(complaint=self.complaint)
+        self.assertEqual(rating.score, 4)
+        self.assertEqual(rating.comment, "Sorted quickly, thank you.")
+        self.assertEqual(rating.rated_by, self.user)
+
+    def test_the_comment_is_optional(self):
+        self.close()
+        self.rate(3)
+
+        self.assertEqual(
+            ComplaintRating.objects.get(complaint=self.complaint).comment,
+            "",
+        )
+
+    def test_an_open_complaint_cannot_be_rated(self):
+        """'When a complaint is closed' is the whole trigger."""
+        with self.assertRaises(ValueError) as caught:
+            rate_complaint(self.complaint, actor=self.user, score=5)
+
+        self.assertIn("closed", str(caught.exception))
+        self.assertEqual(ComplaintRating.objects.count(), 0)
+
+    def test_a_resolved_complaint_cannot_be_rated_yet(self):
+        """Resolved is not closed: the reopen window is still open."""
+        self.complaint.status = Complaint.Status.RESOLVED
+        self.complaint.save(update_fields=["status"])
+
+        with self.assertRaises(ValueError):
+            rate_complaint(self.complaint, actor=self.user, score=5)
+
+    def test_staff_cannot_rate_the_complaint(self):
+        """Nobody rates their own work."""
+        self.close()
+
+        with self.assertRaises(ValueError) as caught:
+            rate_complaint(self.complaint, actor=self.agent, score=5)
+
+        self.assertIn("lodged", str(caught.exception))
+
+    def test_a_complaint_cannot_be_rated_twice(self):
+        self.close()
+        self.rate(5)
+
+        with self.assertRaises(ValueError) as caught:
+            rate_complaint(self.complaint, actor=self.user, score=1)
+
+        self.assertIn("already been rated", str(caught.exception))
+        self.assertEqual(
+            ComplaintRating.objects.get(complaint=self.complaint).score, 5,
+        )
+
+    def test_a_rating_cannot_be_changed_once_given(self):
+        """A department average nobody can reconcile is worse than none."""
+        self.close()
+        self.rate(5)
+        rating = ComplaintRating.objects.get(complaint=self.complaint)
+
+        rating.score = 1
+
+        with self.assertRaises(ValueError):
+            rating.save()
+
+    def test_a_score_outside_one_to_five_is_refused(self):
+        self.close()
+
+        for score in (0, 6, -1, 100):
+            with self.subTest(score=score):
+                with self.assertRaises(ValueError):
+                    rate_complaint(
+                        self.complaint, actor=self.user, score=score,
+                    )
+
+        self.assertEqual(ComplaintRating.objects.count(), 0)
+
+    def test_a_non_integer_score_is_refused(self):
+        """'5' from a form field is coerced before it reaches here."""
+        self.close()
+
+        for score in ("5", 4.5, None):
+            with self.subTest(score=score):
+                with self.assertRaises(ValueError):
+                    rate_complaint(
+                        self.complaint, actor=self.user, score=score,
+                    )
+
+    # --- the department average, which T8-32 will display ----------
+
+    def test_the_department_average_is_the_mean_of_its_ratings(self):
+        for score in (5, 4, 3):
+            complaint = self.make_complaint(
+                assigned_department=self.department,
+            )
+            self.close(complaint)
+            rate_complaint(complaint, actor=self.user, score=score)
+
+        self.assertEqual(
+            department_average_rating(self.department), 4.0,
+        )
+
+    def test_a_department_with_no_ratings_averages_none_not_zero(self):
+        """Zero is a score nobody can give, so it cannot mean 'none'."""
+        self.assertIsNone(department_average_rating(self.department))
+
+    def test_the_average_counts_only_its_own_department(self):
+        other_department = Department.objects.create(
+            name="Facilities", code="facilities",
+        )
+        other_category = Category.objects.create(
+            name="Facilities", code="fac", department=other_department,
+            sla_hours=24,
+        )
+
+        mine = self.make_complaint(assigned_department=self.department)
+        self.close(mine)
+        rate_complaint(mine, actor=self.user, score=5)
+
+        theirs = self.make_complaint(
+            category=other_category, assigned_department=other_department,
+        )
+        self.close(theirs)
+        rate_complaint(theirs, actor=self.user, score=1)
+
+        self.assertEqual(department_average_rating(self.department), 5.0)
+        self.assertEqual(department_average_rating(other_department), 1.0)
+
+    # --- what the complainant sees ---------------------------------
+
+    def test_the_form_appears_only_once_the_complaint_is_closed(self):
+        before = self.client.get(f"/{self.complaint.reference_id}/")
+        self.assertNotContains(before, "Rate this resolution")
+
+        self.close()
+
+        after = self.client.get(f"/{self.complaint.reference_id}/")
+        self.assertContains(after, "Rate this resolution")
+
+    def test_the_given_rating_replaces_the_form(self):
+        self.close()
+        self.rate(4, "Good work.")
+
+        page = self.client.get(f"/{self.complaint.reference_id}/")
+
+        self.assertContains(page, "4 out of 5")
+        self.assertContains(page, "Good work.")
+        self.assertNotContains(page, "Rate this resolution")
+
+
 class SecureEvidenceStorageTests(BaseFixture):
     """SCMS-SR-005 / TC-Sec-05: how evidence is stored and served.
 
@@ -3519,6 +3704,7 @@ class UrlTamperingSweepTests(RoleFixture):
                                         "reason": "Any reason at all."}),
         "complaint_status": ("post", {"status": "IN_PROGRESS"}),
         "complaint_resolve": ("post", {"remarks": "x" * 60}),
+        "complaint_rate": ("post", {"score": "5"}),
     }
 
     def path_for(self, name):
@@ -3535,6 +3721,7 @@ class UrlTamperingSweepTests(RoleFixture):
             "complaint_priority": "priority/",
             "complaint_status": "status/",
             "complaint_resolve": "resolve/",
+            "complaint_rate": "rate/",
         }[name]
 
         return f"/{reference}/{suffix}"
