@@ -1,6 +1,20 @@
 {% extends "complaints/base.html" %}
 
 {% block content %}
+{# SCMS-F-026. The links carry the current query string, so an
+   export returns the rows on screen rather than everything. #}
+<p>
+    <a class="button"
+       href="{% url 'complaints:complaint_export' 'csv' %}?{{ request.GET.urlencode }}">
+        Export CSV
+    </a>
+    <a class="button"
+       href="{% url 'complaints:complaint_export' 'pdf' %}?{{ request.GET.urlencode }}">
+        Export PDF
+    </a>
+    <a class="button" href="{% url 'complaints:dashboard' %}">Dashboard</a>
+</p>
+
   <h1>Complaint queue</h1>
   <p>Showing complaints visible to your role.</p>
 

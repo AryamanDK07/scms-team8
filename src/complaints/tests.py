@@ -1,8 +1,10 @@
+import csv
 import logging
 import re
 import shutil
 import tempfile
 from datetime import datetime, timedelta
+from io import StringIO
 from pathlib import Path
 from unittest import skipUnless
 from unittest.mock import patch
@@ -34,6 +36,7 @@ from .models import (
     UserProfile,
 )
 from .security import LOCKOUT_THRESHOLD
+from .exports import HEADERS as export_headers
 from .services import (
     STATUS_TRANSITIONS,
     add_comment,
@@ -41,6 +44,7 @@ from .services import (
     calculate_sla_deadline,
     can_reopen,
     close_expired_complaints,
+    dashboard_figures,
     comment_thread,
     department_average_rating,
     may_reopen,
@@ -54,6 +58,7 @@ from .services import (
     RESOLUTION_REMARKS_MIN,
     resolve_complaint,
     transition_status,
+    visible_complaints,
 )
 
 
@@ -3261,6 +3266,201 @@ class ObjectLevelAccessTests(RoleFixture):
         self.assertFalse(can_view_complaint(orphan, self.complaint))
 
 
+class DashboardTests(RoleFixture):
+    """SCMS-F-025 / TC-Rep-01: figures scoped to the viewer's role."""
+
+    URL = "/dashboard/"
+
+    def setUp(self):
+        super().setUp()
+        # One complaint in each department, assigned to its agent.
+        self.mine = self.complaint
+        self.mine.assigned_to = self.agent
+        self.mine.assigned_department = self.department
+        self.mine.save(update_fields=[
+            "assigned_to", "assigned_department",
+        ])
+
+        self.theirs = self.make_complaint(
+            title="Lift out of order",
+            assigned_department=self.other_department,
+            assigned_to=self.other_agent,
+        )
+
+    def figures_for(self, user):
+        return dashboard_figures(user)
+
+    def test_an_agent_sees_only_their_own_complaints(self):
+        figures = self.figures_for(self.agent)
+
+        self.assertEqual(figures["total"], 1)
+
+    def test_a_department_admin_sees_their_department(self):
+        figures = self.figures_for(self.dept_admin)
+
+        self.assertEqual(figures["total"], 1)
+
+    def test_a_system_admin_sees_everything(self):
+        figures = self.figures_for(self.sys_admin)
+
+        self.assertEqual(figures["total"], 2)
+
+    def test_a_complainant_is_refused_the_page(self):
+        self.client.force_login(self.user)
+
+        self.assertEqual(self.client.get(self.URL).status_code, 403)
+
+    def test_the_page_renders_for_staff(self):
+        self.client.force_login(self.dept_admin)
+        response = self.client.get(self.URL)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Dashboard")
+
+    def test_the_other_departments_complaint_is_not_named(self):
+        """The leak a dashboard makes easy: totals that over-reach."""
+        self.client.force_login(self.dept_admin)
+        response = self.client.get(self.URL)
+
+        self.assertNotContains(response, "Lift out of order")
+
+    def test_counts_are_grouped_by_status_and_priority(self):
+        figures = self.figures_for(self.sys_admin)
+
+        self.assertEqual(sum(figures["by_status"].values()), 2)
+        self.assertEqual(sum(figures["by_priority"].values()), 2)
+
+    def test_a_breached_sla_is_counted_only_while_open(self):
+        self.mine.sla_due_at = timezone.now() - timedelta(hours=1)
+        self.mine.save(update_fields=["sla_due_at"])
+
+        self.assertEqual(self.figures_for(self.agent)["sla_breached"], 1)
+
+        # Closed and late is history, not something anyone can act on.
+        self.mine.status = Complaint.Status.CLOSED
+        self.mine.save(update_fields=["status"])
+
+        self.assertEqual(self.figures_for(self.agent)["sla_breached"], 0)
+
+    def test_the_average_rating_appears_once_a_rating_exists(self):
+        self.assertIsNone(
+            self.figures_for(self.dept_admin)["average_rating"],
+        )
+
+        self.mine.status = Complaint.Status.CLOSED
+        self.mine.save(update_fields=["status"])
+        rate_complaint(self.mine, actor=self.user, score=4)
+
+        figures = self.figures_for(self.dept_admin)
+        self.assertEqual(figures["average_rating"], 4.0)
+        self.assertEqual(figures["rating_count"], 1)
+
+    def test_the_average_is_scoped_like_everything_else(self):
+        """The T8-27 half that was waiting on this page."""
+        self.theirs.status = Complaint.Status.CLOSED
+        self.theirs.save(update_fields=["status"])
+        rate_complaint(self.theirs, actor=self.user, score=1)
+
+        self.assertIsNone(
+            self.figures_for(self.dept_admin)["average_rating"],
+        )
+        self.assertEqual(
+            self.figures_for(self.other_dept_admin)["average_rating"], 1.0,
+        )
+
+
+class ExportTests(RoleFixture):
+    """SCMS-F-026 / TC-Rep-02: CSV and PDF match the filtered list."""
+
+    def setUp(self):
+        super().setUp()
+        self.mine = self.complaint
+        self.mine.assigned_department = self.department
+        self.mine.save(update_fields=["assigned_department"])
+
+        self.theirs = self.make_complaint(
+            title="Lift out of order",
+            assigned_department=self.other_department,
+        )
+        self.client.force_login(self.sys_admin)
+
+    def csv_rows(self, query=""):
+        response = self.client.get(f"/export/csv/{query}")
+        body = response.content.decode()
+
+        return response, list(csv.reader(StringIO(body)))
+
+    def test_csv_has_a_header_and_one_row_per_complaint(self):
+        response, rows = self.csv_rows()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(rows[0], list(export_headers))
+        self.assertEqual(len(rows) - 1, 2)
+
+    def test_csv_is_served_as_a_download(self):
+        response = self.client.get("/export/csv/")
+
+        self.assertEqual(response["Content-Type"], "text/csv")
+        self.assertIn("attachment", response["Content-Disposition"])
+
+    def test_the_export_obeys_the_same_filter_as_the_page(self):
+        """The acceptance criterion, checked against the page itself."""
+        query = "?q=Lift"
+
+        page = self.client.get(f"/queue/{query}")
+        _, rows = self.csv_rows(query)
+
+        self.assertEqual(len(rows) - 1, 1)
+        self.assertEqual(rows[1][1], "Lift out of order")
+        self.assertContains(page, "Lift out of order")
+        self.assertNotContains(page, self.mine.reference_id)
+
+    def test_the_export_obeys_role_scoping(self):
+        """An export must not be a way around SCMS-SR-003."""
+        self.client.force_login(self.dept_admin)
+        _, rows = self.csv_rows()
+
+        self.assertEqual(len(rows) - 1, 1)
+        self.assertEqual(rows[1][0], self.mine.reference_id)
+
+    def test_a_complainant_cannot_export_at_all(self):
+        self.client.force_login(self.user)
+
+        self.assertEqual(
+            self.client.get("/export/csv/").status_code, 403,
+        )
+        self.assertEqual(
+            self.client.get("/export/pdf/").status_code, 403,
+        )
+
+    def test_pdf_is_a_pdf_and_is_not_empty(self):
+        response = self.client.get("/export/pdf/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response["Content-Type"], "application/pdf")
+        self.assertIn("attachment", response["Content-Disposition"])
+        self.assertTrue(response.content.startswith(b"%PDF"))
+        self.assertGreater(len(response.content), 1000)
+
+    def test_both_formats_report_the_same_rows(self):
+        """One column definition, so the two cannot drift apart."""
+        from .exports import COLUMNS, rows_for
+
+        complaints = visible_complaints(self.sys_admin).order_by(
+            "sla_due_at",
+        )
+        rows = rows_for(complaints)
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(rows[0]), len(COLUMNS))
+
+        _, csv_data = self.csv_rows()
+        self.assertEqual(
+            [row[0] for row in rows],
+            [row[0] for row in csv_data[1:]],
+        )
+
+
 class ReopenWindowFlowTests(BaseFixture):
     """SCMS-F-019 / TC-Res-02: reopen on day 6, not day 8.
 
@@ -3450,7 +3650,6 @@ class ReopenWindowFlowTests(BaseFixture):
         )
 
     def test_the_management_command_closes_and_reports(self):
-        from io import StringIO
         from django.core.management import call_command
 
         self.resolve(days_ago=9)

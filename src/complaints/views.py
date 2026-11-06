@@ -6,7 +6,11 @@ from django.http import FileResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from .services import calculate_sla_deadline
 
-from .attachments import MAX_PER_COMPLAINT, canonical_content_type
+from . import exports
+from .attachments import (
+    MAX_PER_COMPLAINT,
+    canonical_content_type,
+)
 from .forms import (
     AssignComplaintForm,
     AttachmentForm,
@@ -26,7 +30,7 @@ from .models import (
     ComplaintStatusHistory,
 )
 from .permissions import require_complaint_access, role_required
-from .roles import Role, STAFF_ROLES, get_department, get_role
+from .roles import Role, STAFF_ROLES, get_role
 from .services import (
     add_comment,
     allowed_transitions,
@@ -34,6 +38,7 @@ from .services import (
     assign_complaint,
     can_rate,
     comment_thread,
+    dashboard_figures,
     offerable_transitions,
     override_priority,
     may_reopen,
@@ -42,6 +47,7 @@ from .services import (
     reopen_complaint,
     resolve_complaint,
     transition_status,
+    visible_complaints,
 )
 
 
@@ -540,31 +546,8 @@ def department_queue(request):
     An agent sees only complaints assigned to them; a Department
     Admin sees their department; a System Admin sees everything.
     """
-    complaints = Complaint.objects.select_related(
-        "assigned_department",
-        "assigned_to",
-        "category",
-    )
-
     role = get_role(request.user)
-
-    if role == Role.SUPPORT_AGENT:
-        complaints = complaints.filter(assigned_to=request.user)
-    elif role == Role.DEPARTMENT_ADMIN:
-        complaints = complaints.filter(
-            assigned_department=get_department(request.user),
-        )
-
-    # SCMS-F-028. The search runs on the queryset the role scoping
-    # has already narrowed, so filtering can only ever subtract.
-    # Building a fresh queryset here would make search a way around
-    # SCMS-SR-003.
-    search = ComplaintSearchForm(request.GET or None)
-
-    if search.is_valid():
-        complaints = apply_complaint_filters(
-            complaints, search.cleaned_data,
-        )
+    complaints, search = scoped_and_filtered(request)
 
     return render(
         request,
@@ -691,3 +674,52 @@ def complaint_reopen(request, reference_id):
             "can_reopen": False,
         },
     )
+
+
+def scoped_and_filtered(request):
+    """The complaints this user may see, narrowed by the search.
+
+    Shared by the queue, the dashboard links and both exports, so
+    an export cannot return a different set of rows from the page
+    it was launched from -- which is exactly what SCMS-F-026's
+    acceptance criterion asks.
+
+    SCMS-F-028: the search runs on the queryset the role scoping
+    has already narrowed, so filtering can only ever subtract.
+    Building a fresh queryset here would make search a way around
+    SCMS-SR-003.
+    """
+    complaints = visible_complaints(request.user)
+    search = ComplaintSearchForm(request.GET or None)
+
+    if search.is_valid():
+        complaints = apply_complaint_filters(
+            complaints, search.cleaned_data,
+        )
+
+    return complaints, search
+
+
+@role_required(*STAFF_ROLES)
+def dashboard(request):
+    """Role-scoped workload and SLA dashboard (SCMS-F-025)."""
+    return render(
+        request,
+        "complaints/dashboard.html",
+        {
+            "figures": dashboard_figures(request.user),
+            "role": get_role(request.user),
+        },
+    )
+
+
+@role_required(*STAFF_ROLES)
+def complaint_export(request, extension):
+    """Export the filtered list as CSV or PDF (SCMS-F-026)."""
+    complaints, _ = scoped_and_filtered(request)
+    complaints = complaints.order_by("sla_due_at")
+
+    if extension == "csv":
+        return exports.as_csv(complaints)
+
+    return exports.as_pdf(complaints)
