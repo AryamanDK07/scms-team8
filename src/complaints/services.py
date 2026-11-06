@@ -605,3 +605,137 @@ def department_average_rating(department):
     ).aggregate(average=Avg("score"))
 
     return result["average"]
+
+
+def may_reopen(complaint, user):
+    """Whether this user may reopen this complaint right now.
+
+    can_reopen() answers the question about the complaint -- is it
+    resolved, unreopened, still inside the window. This adds the
+    one about the person, so a template asking "show the button?"
+    and reopen_complaint deciding "allow it?" cannot disagree.
+    """
+    if complaint.submitted_by_id != getattr(user, "id", None):
+        return False
+
+    return can_reopen(complaint)
+
+
+def reopen_complaint(complaint, actor, reason="", source_ip=None):
+    """Reopen a resolved complaint within its window (SCMS-F-019).
+
+    Once only, within REOPEN_WINDOW_DAYS of resolution, and only by
+    the person who lodged it: reopening is the complainant saying
+    the fix did not work, so it is not an action staff take on
+    their behalf.
+
+    resolved_at is deliberately left as it was. It records when the
+    complaint was resolved, which is what the reopen window was
+    measured from, and clearing it would erase the evidence that
+    the window was honoured.
+    """
+    if complaint.submitted_by_id != getattr(actor, "id", None):
+        raise ValueError(
+            "Only the person who lodged a complaint can reopen it."
+        )
+
+    if complaint.status != Complaint.Status.RESOLVED:
+        raise ValueError(
+            "Only a resolved complaint can be reopened."
+        )
+
+    if complaint.reopen_count >= 1:
+        raise ValueError(
+            "This complaint has already been reopened once."
+        )
+
+    if not can_reopen(complaint):
+        raise ValueError(
+            f"The {REOPEN_WINDOW_DAYS}-day window for reopening this "
+            f"complaint has passed."
+        )
+
+    labels = dict(Complaint.Status.choices)
+    detail = "Reopened by the complainant."
+
+    if reason.strip():
+        detail = f"{detail} {reason.strip()}"
+
+    with transaction.atomic():
+        complaint.status = Complaint.Status.REOPENED
+        complaint.reopened_at = timezone.now()
+        complaint.reopen_count += 1
+        complaint.save(update_fields=[
+            "status", "reopened_at", "reopen_count", "updated_at",
+        ])
+
+        ComplaintStatusHistory.objects.create(
+            complaint=complaint,
+            old_status=Complaint.Status.RESOLVED,
+            new_status=Complaint.Status.REOPENED,
+            field_name="status",
+            old_value=labels[Complaint.Status.RESOLVED],
+            new_value=labels[Complaint.Status.REOPENED],
+            changed_by=actor,
+            source_ip=source_ip,
+            comment=detail,
+        )
+
+    return complaint
+
+
+def close_expired_complaints(now=None):
+    """Close resolved complaints whose reopen window has passed.
+
+    SCMS-F-019: after the window, the complaint closes itself. The
+    acceptance criterion puts this at day 8, which is the first
+    moment a complaint resolved on day 0 is past a 7-day window.
+
+    Returns the number closed.
+
+    The actor on these audit rows is None, which the column allows.
+    That is the honest record: no person closed these, a scheduled
+    job did, and naming a user would put someone's name against an
+    action they did not take.
+
+    WHAT THIS DOES NOT DO: run itself. It is invoked by the
+    close_expired_complaints management command, and scheduling
+    that command -- cron, or Celery Beat once SCMS-F-021 brings
+    Celery in -- is deployment configuration. Until something runs
+    it, auto-closure happens only when someone runs it by hand.
+    """
+    moment = now or timezone.now()
+    cutoff = moment - timedelta(days=REOPEN_WINDOW_DAYS)
+    labels = dict(Complaint.Status.choices)
+
+    expired = Complaint.objects.filter(
+        status=Complaint.Status.RESOLVED,
+        resolved_at__lte=cutoff,
+    )
+
+    closed = 0
+
+    for complaint in expired:
+        with transaction.atomic():
+            complaint.status = Complaint.Status.CLOSED
+            complaint.save(update_fields=["status", "updated_at"])
+
+            ComplaintStatusHistory.objects.create(
+                complaint=complaint,
+                old_status=Complaint.Status.RESOLVED,
+                new_status=Complaint.Status.CLOSED,
+                field_name="status",
+                old_value=labels[Complaint.Status.RESOLVED],
+                new_value=labels[Complaint.Status.CLOSED],
+                changed_by=None,
+                source_ip=None,
+                comment=(
+                    f"Closed automatically: the "
+                    f"{REOPEN_WINDOW_DAYS}-day window for reopening "
+                    f"passed without the complainant reopening it."
+                ),
+            )
+
+        closed += 1
+
+    return closed

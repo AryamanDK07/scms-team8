@@ -81,6 +81,37 @@
 </div>
 {% endif %}
 
+{# SCMS-F-019. The complainant's one chance to say the fix did not
+   work, offered only while the window is open. #}
+{% if can_reopen %}
+<div class="card">
+    <h2>Not fixed?</h2>
+    <p class="muted">
+        If this has not actually been resolved you can reopen it
+        once, within 7 days of it being resolved. After that it
+        closes automatically.
+    </p>
+
+    <form method="post"
+          action="{% url 'complaints:complaint_reopen' complaint.reference_id %}">
+        {% csrf_token %}
+
+        {% for error in reopen_form.non_field_errors %}
+            <p class="errorlist">{{ error }}</p>
+        {% endfor %}
+
+        <p>
+            <label for="{{ reopen_form.reason.id_for_label }}">
+                Reason for reopening
+            </label>
+            {{ reopen_form.reason }}
+        </p>
+
+        <button type="submit" class="button">Reopen complaint</button>
+    </form>
+</div>
+{% endif %}
+
 {# SCMS-F-020. Shown once the complaint is closed: either the
    rating already given, or the form, to the complainant alone. #}
 {% if complaint.rating %}

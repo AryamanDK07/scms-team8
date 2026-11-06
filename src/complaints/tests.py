@@ -40,13 +40,17 @@ from .services import (
     assign_complaint,
     calculate_sla_deadline,
     can_reopen,
+    close_expired_complaints,
     comment_thread,
     department_average_rating,
+    may_reopen,
     eligible_agents,
     offerable_transitions,
     override_priority,
     priority_for,
     rate_complaint,
+    reopen_complaint,
+    REOPEN_WINDOW_DAYS,
     RESOLUTION_REMARKS_MIN,
     resolve_complaint,
     transition_status,
@@ -3257,6 +3261,232 @@ class ObjectLevelAccessTests(RoleFixture):
         self.assertFalse(can_view_complaint(orphan, self.complaint))
 
 
+class ReopenWindowFlowTests(BaseFixture):
+    """SCMS-F-019 / TC-Res-02: reopen on day 6, not day 8.
+
+    The acceptance criterion names three moments, so all three are
+    here: reopening works on day 6, is refused on day 8, and the
+    auto-closure sweep closes the complaint on day 8.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.complaint = self.make_complaint(
+            assigned_department=self.department,
+        )
+        self.agent = get_user_model().objects.create_user(
+            username="agent", password="not-a-real-password",
+        )
+        self.client.force_login(self.user)
+
+    def resolve(self, days_ago, complaint=None):
+        """Put a complaint into Resolved as of N days ago."""
+        target = complaint or self.complaint
+        target.status = Complaint.Status.RESOLVED
+        target.resolved_at = timezone.now() - timedelta(days=days_ago)
+        target.save(update_fields=["status", "resolved_at"])
+
+        return target
+
+    def post_reopen(self, reason="Still leaking."):
+        return self.client.post(
+            f"/{self.complaint.reference_id}/reopen/", {"reason": reason},
+        )
+
+    # --- the three moments the criterion names ---------------------
+
+    def test_reopening_works_on_day_six(self):
+        self.resolve(days_ago=6)
+
+        response = self.post_reopen()
+        self.complaint.refresh_from_db()
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.complaint.status, Complaint.Status.REOPENED)
+        self.assertEqual(self.complaint.reopen_count, 1)
+        self.assertIsNotNone(self.complaint.reopened_at)
+
+    def test_reopening_is_refused_on_day_eight(self):
+        self.resolve(days_ago=8)
+
+        with self.assertRaises(ValueError) as caught:
+            reopen_complaint(self.complaint, actor=self.user)
+
+        self.assertIn(f"{REOPEN_WINDOW_DAYS}-day", str(caught.exception))
+        self.complaint.refresh_from_db()
+        self.assertEqual(self.complaint.status, Complaint.Status.RESOLVED)
+
+    def test_auto_closure_closes_it_on_day_eight(self):
+        self.resolve(days_ago=8)
+
+        self.assertEqual(close_expired_complaints(), 1)
+
+        self.complaint.refresh_from_db()
+        self.assertEqual(self.complaint.status, Complaint.Status.CLOSED)
+
+    # --- the boundary itself ---------------------------------------
+
+    def test_the_window_is_open_right_up_to_seven_days(self):
+        """Day 7 exactly is still inside the window, not past it."""
+        self.resolve(days_ago=REOPEN_WINDOW_DAYS)
+        self.complaint.resolved_at = (
+            timezone.now() - timedelta(days=REOPEN_WINDOW_DAYS)
+            + timedelta(minutes=1)
+        )
+        self.complaint.save(update_fields=["resolved_at"])
+
+        self.assertTrue(may_reopen(self.complaint, self.user))
+        self.assertEqual(close_expired_complaints(), 0)
+
+    # --- who, and how often ----------------------------------------
+
+    def test_a_complaint_can_only_be_reopened_once(self):
+        self.resolve(days_ago=1)
+        reopen_complaint(self.complaint, actor=self.user)
+
+        # Back to Resolved, still inside the window, but used up.
+        self.resolve(days_ago=1)
+
+        with self.assertRaises(ValueError) as caught:
+            reopen_complaint(self.complaint, actor=self.user)
+
+        self.assertIn("already been reopened", str(caught.exception))
+
+    def test_staff_cannot_reopen_on_the_complainants_behalf(self):
+        """Reopening is the complainant saying the fix did not work."""
+        self.resolve(days_ago=1)
+
+        with self.assertRaises(ValueError) as caught:
+            reopen_complaint(self.complaint, actor=self.agent)
+
+        self.assertIn("lodged", str(caught.exception))
+
+    def test_only_a_resolved_complaint_can_be_reopened(self):
+        for status in (
+            Complaint.Status.OPEN,
+            Complaint.Status.IN_PROGRESS,
+            Complaint.Status.CLOSED,
+        ):
+            with self.subTest(status=status):
+                self.complaint.status = status
+                self.complaint.resolved_at = timezone.now()
+                self.complaint.save(
+                    update_fields=["status", "resolved_at"],
+                )
+
+                with self.assertRaises(ValueError):
+                    reopen_complaint(self.complaint, actor=self.user)
+
+    # --- what the trail records ------------------------------------
+
+    def test_reopening_is_recorded_with_actor_and_reason(self):
+        self.resolve(days_ago=2)
+        self.post_reopen("The projector still will not switch on.")
+
+        entry = self.complaint.status_history.filter(
+            new_status=Complaint.Status.REOPENED,
+        ).get()
+
+        self.assertEqual(entry.old_status, Complaint.Status.RESOLVED)
+        self.assertEqual(entry.changed_by, self.user)
+        self.assertIsNotNone(entry.source_ip)
+        self.assertIn("still will not switch on", entry.comment)
+
+    def test_resolved_at_survives_a_reopen(self):
+        """It is the evidence that the window was honoured."""
+        self.resolve(days_ago=3)
+        was_resolved_at = self.complaint.resolved_at
+
+        reopen_complaint(self.complaint, actor=self.user)
+        self.complaint.refresh_from_db()
+
+        self.assertEqual(self.complaint.resolved_at, was_resolved_at)
+
+    def test_auto_closure_records_no_actor(self):
+        """Nobody closed these, so no name goes against the action."""
+        self.resolve(days_ago=9)
+        close_expired_complaints()
+
+        entry = self.complaint.status_history.filter(
+            new_status=Complaint.Status.CLOSED,
+        ).get()
+
+        self.assertIsNone(entry.changed_by)
+        self.assertIn("automatically", entry.comment)
+
+    # --- what the sweep leaves alone -------------------------------
+
+    def test_auto_closure_leaves_complaints_inside_the_window(self):
+        self.resolve(days_ago=6)
+
+        self.assertEqual(close_expired_complaints(), 0)
+
+        self.complaint.refresh_from_db()
+        self.assertEqual(self.complaint.status, Complaint.Status.RESOLVED)
+
+    def test_auto_closure_ignores_complaints_that_are_not_resolved(self):
+        """A reopened complaint is being worked on, not abandoned."""
+        self.resolve(days_ago=1)
+        reopen_complaint(self.complaint, actor=self.user)
+        self.complaint.resolved_at = timezone.now() - timedelta(days=30)
+        self.complaint.save(update_fields=["resolved_at"])
+
+        self.assertEqual(close_expired_complaints(), 0)
+
+        self.complaint.refresh_from_db()
+        self.assertEqual(self.complaint.status, Complaint.Status.REOPENED)
+
+    def test_auto_closure_is_safe_to_run_twice(self):
+        """A scheduler that fires twice must not write two rows."""
+        self.resolve(days_ago=9)
+
+        self.assertEqual(close_expired_complaints(), 1)
+        self.assertEqual(close_expired_complaints(), 0)
+        self.assertEqual(
+            self.complaint.status_history.filter(
+                new_status=Complaint.Status.CLOSED,
+            ).count(),
+            1,
+        )
+
+    def test_the_management_command_closes_and_reports(self):
+        from io import StringIO
+        from django.core.management import call_command
+
+        self.resolve(days_ago=9)
+        out = StringIO()
+
+        call_command("close_expired_complaints", stdout=out)
+
+        self.assertIn("1 complaint(s) closed", out.getvalue())
+        self.complaint.refresh_from_db()
+        self.assertEqual(self.complaint.status, Complaint.Status.CLOSED)
+
+    def test_the_dry_run_changes_nothing(self):
+        from io import StringIO
+        from django.core.management import call_command
+
+        self.resolve(days_ago=9)
+        out = StringIO()
+
+        call_command("close_expired_complaints", "--dry-run", stdout=out)
+
+        self.assertIn("would close", out.getvalue())
+        self.complaint.refresh_from_db()
+        self.assertEqual(self.complaint.status, Complaint.Status.RESOLVED)
+
+    # --- what the complainant sees ---------------------------------
+
+    def test_the_button_appears_on_day_six_and_not_on_day_eight(self):
+        self.resolve(days_ago=6)
+        page = self.client.get(f"/{self.complaint.reference_id}/")
+        self.assertContains(page, "Reopen complaint")
+
+        self.resolve(days_ago=8)
+        page = self.client.get(f"/{self.complaint.reference_id}/")
+        self.assertNotContains(page, "Reopen complaint")
+
+
 class RatingTests(BaseFixture):
     """SCMS-F-020 / TC-Res-03: a 1-to-5 rating on closure."""
 
@@ -3705,6 +3935,7 @@ class UrlTamperingSweepTests(RoleFixture):
         "complaint_status": ("post", {"status": "IN_PROGRESS"}),
         "complaint_resolve": ("post", {"remarks": "x" * 60}),
         "complaint_rate": ("post", {"score": "5"}),
+        "complaint_reopen": ("post", {"reason": "Still broken."}),
     }
 
     def path_for(self, name):
@@ -3722,6 +3953,7 @@ class UrlTamperingSweepTests(RoleFixture):
             "complaint_status": "status/",
             "complaint_resolve": "resolve/",
             "complaint_rate": "rate/",
+            "complaint_reopen": "reopen/",
         }[name]
 
         return f"/{reference}/{suffix}"

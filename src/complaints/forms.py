@@ -542,3 +542,25 @@ class RatingForm(forms.Form):
         }),
         label="Comment",
     )
+
+
+class ReopenForm(forms.Form):
+    """Reopen a resolved complaint (SCMS-F-019).
+
+    The reason is optional, because the SRS does not ask for one.
+    It is offered because an agent picking the complaint back up
+    has nothing else to go on, and recorded in the audit trail
+    when given.
+    """
+
+    reason = forms.CharField(
+        required=False,
+        max_length=1000,
+        widget=forms.Textarea(attrs={
+            "rows": 3,
+            "placeholder": (
+                "What is still wrong? (optional, but it helps)"
+            ),
+        }),
+        label="Reason for reopening",
+    )
