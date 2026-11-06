@@ -15,6 +15,7 @@ from django.contrib.auth.hashers import make_password
 from django.contrib.auth.tokens import PasswordResetTokenGenerator
 from django.contrib.sessions.models import Session
 from django.core import mail
+from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import DatabaseError, connection, transaction
 from django.test import TestCase, override_settings
@@ -27,13 +28,21 @@ from .models import (
     Complaint,
     ComplaintAttachment,
     ComplaintComment,
+    ComplaintDraft,
     ComplaintRating,
     ComplaintStatusHistory,
     Department,
+    DuplicateFlag,
+    DuplicateVerdict,
     SecurityEvent,
     SecurityEventType,
     SubCategory,
     UserProfile,
+)
+from .ratelimit import (
+    LOGIN_LIMIT,
+    SUBMISSION_LIMIT,
+    too_many_submissions,
 )
 from .security import LOCKOUT_THRESHOLD
 from .exports import HEADERS as export_headers
@@ -45,6 +54,10 @@ from .services import (
     can_reopen,
     close_expired_complaints,
     dashboard_figures,
+    DUPLICATE_THRESHOLD,
+    DUPLICATE_WINDOW_DAYS,
+    flag_duplicates,
+    get_draft,
     comment_thread,
     department_average_rating,
     may_reopen,
@@ -52,8 +65,11 @@ from .services import (
     offerable_transitions,
     override_priority,
     priority_for,
+    purge_expired_drafts,
     rate_complaint,
     reopen_complaint,
+    resolve_duplicate_flag,
+    save_draft,
     REOPEN_WINDOW_DAYS,
     RESOLUTION_REMARKS_MIN,
     resolve_complaint,
@@ -84,6 +100,15 @@ def _scanner_that_reads_everything(upload):
     return None
 
 
+#: SCMS-SR-007 limits are off for the suite at large and switched
+#: on by the tests that are about them. Otherwise any test posting
+#: a form six times would trip a limit it was not written to
+#: exercise, and the failure would look like something else.
+limits_off = override_settings(RATE_LIMITS_ENABLED=False)
+limits_on = override_settings(RATE_LIMITS_ENABLED=True)
+
+
+@limits_off
 class BaseFixture(TestCase):
     def setUp(self):
         self.department = Department.objects.create(
@@ -236,6 +261,7 @@ class RoutingTests(BaseFixture):
         self.assertEqual(self.category.department, other)
 
 
+@limits_off
 class EmailLoginTests(TestCase):
     """SCMS-F-002 / TC-Auth-02: sign in with e-mail and password."""
 
@@ -308,6 +334,7 @@ class EmailLoginTests(TestCase):
         self.assertIsNone(self.logged_in_as())
 
 
+@limits_off
 class SessionExpiryTests(TestCase):
     """SCMS-F-002 / TC-Auth-02: 30 minutes of inactivity ends it."""
 
@@ -354,6 +381,7 @@ class SessionExpiryTests(TestCase):
         self.assertEqual(self.client.get("/").status_code, 200)
 
 
+@limits_off
 class PasswordResetTests(TestCase):
     """SCMS-F-004 / TC-Auth-04: single-use link, valid 15 minutes."""
 
@@ -2663,6 +2691,7 @@ class AuditTrailCompletenessTests(BaseFixture):
         self.assertEqual(complaint.status_history.count(), before)
 
 
+@limits_off
 class PasswordHashingTests(TestCase):
     """SCMS-SR-002 / TC-Sec-02: Argon2id, and never in the clear.
 
@@ -2820,6 +2849,7 @@ class PasswordHashingTests(TestCase):
         self.assertEqual(self.stored_hash(), legacy)
 
 
+@limits_off
 class AccountLockoutTests(TestCase):
     """SCMS-F-005 / TC-Auth-05: lock after 5 consecutive failures."""
 
@@ -3264,6 +3294,551 @@ class ObjectLevelAccessTests(RoleFixture):
         orphan.profile.delete()
         orphan.refresh_from_db()
         self.assertFalse(can_view_complaint(orphan, self.complaint))
+
+
+class TemplateCommentLeakTests(BaseFixture):
+    """No page may show its own source comments to a user.
+
+    Django's {# #} comment works on ONE line only. Spread over
+    two, the template engine does not recognise it and renders it
+    as text, so "{# SCMS-F-026. The links carry... #}" appeared at
+    the top of the staff queue in the browser.
+
+    Twelve templates had it, some since sprint 1. Nothing caught
+    it because every template test asserted that particular
+    strings were present, and none asserted that nothing unwanted
+    was. This test is the general form of the question.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.complaint = self.make_complaint(
+            assigned_department=self.department,
+        )
+        profile = self.user.profile
+        profile.role = Role.SYSTEM_ADMIN
+        profile.save()
+        self.client.force_login(self.user)
+
+    def assert_no_leak(self, url):
+        body = self.client.get(url).content.decode()
+
+        for marker in ("{#", "#}", "{%", "%}"):
+            self.assertNotIn(
+                marker,
+                body,
+                f"{url} is showing template source to the user",
+            )
+
+    def test_no_page_leaks_its_template_source(self):
+        for url in (
+            "/",
+            "/new/",
+            "/queue/",
+            "/dashboard/",
+            f"/{self.complaint.reference_id}/",
+            "/accounts/login/",
+        ):
+            with self.subTest(url=url):
+                self.assert_no_leak(url)
+
+
+@limits_on
+class RateLimitTests(BaseFixture):
+    """SCMS-SR-007 / TC-Sec-07: the 6th and the 11th are refused."""
+
+    def setUp(self):
+        super().setUp()
+        # The cache outlives a single test, so a counter left by the
+        # previous one would make these pass or fail for the wrong
+        # reason.
+        cache.clear()
+        self.sub_category = SubCategory.objects.create(
+            name="Projector", code="proj-rl", category=self.category,
+        )
+        self.client.force_login(self.user)
+
+    def tearDown(self):
+        cache.clear()
+        super().tearDown()
+
+    def lodge(self, n=1):
+        responses = []
+
+        for index in range(n):
+            responses.append(self.client.post("/new/", {
+                "title": f"Projector fault {index}",
+                "description": f"Report number {index} about the room.",
+                "location": "Room 302",
+                "category": str(self.category.pk),
+                "sub_category": str(self.sub_category.pk),
+            }))
+
+        return responses
+
+    def test_the_sixth_submission_in_an_hour_is_refused(self):
+        self.lodge(SUBMISSION_LIMIT)
+
+        self.assertEqual(Complaint.objects.count(), SUBMISSION_LIMIT)
+
+        self.lodge(1)
+
+        self.assertEqual(
+            Complaint.objects.count(),
+            SUBMISSION_LIMIT,
+            "the sixth submission was stored anyway",
+        )
+
+    def test_the_refusal_says_why(self):
+        self.lodge(SUBMISSION_LIMIT)
+        response = self.lodge(1)[0]
+
+        self.assertContains(response, "limit")
+
+    def test_the_limit_is_per_account(self):
+        """One person's flood must not lock out everybody else."""
+        self.lodge(SUBMISSION_LIMIT)
+
+        other = get_user_model().objects.create_user(
+            username="second", password="not-a-real-password",
+        )
+        self.client.force_login(other)
+
+        self.lodge(1)
+
+        self.assertEqual(
+            Complaint.objects.count(), SUBMISSION_LIMIT + 1,
+        )
+
+    def test_the_eleventh_login_attempt_is_refused(self):
+        self.client.logout()
+
+        for _ in range(LOGIN_LIMIT):
+            self.client.post("/accounts/login/", {
+                "username": "nobody@example.com",
+                "password": "wrong-password",
+            })
+
+        response = self.client.post("/accounts/login/", {
+            "username": "nobody@example.com",
+            "password": "wrong-password",
+        })
+
+        self.assertContains(response, "Too many sign-in attempts")
+
+    def test_the_login_limit_does_not_block_a_fresh_address(self):
+        self.client.logout()
+
+        for _ in range(LOGIN_LIMIT + 2):
+            self.client.post("/accounts/login/", {
+                "username": "nobody@example.com",
+                "password": "wrong-password",
+            })
+
+        # A different IP has its own counter.
+        response = self.client.post(
+            "/accounts/login/",
+            {"username": "nobody@example.com", "password": "wrong"},
+            REMOTE_ADDR="10.0.0.9",
+        )
+
+        self.assertNotContains(response, "Too many sign-in attempts")
+
+    def test_the_counter_expires_with_its_window(self):
+        """Nothing has to sweep the counters; the cache does it."""
+        self.assertFalse(too_many_submissions(self.user))
+
+        cache.clear()
+
+        for _ in range(SUBMISSION_LIMIT):
+            self.assertFalse(too_many_submissions(self.user))
+
+        self.assertTrue(too_many_submissions(self.user))
+
+
+class DeactivationTests(BaseFixture):
+    """SCMS-F-024 / TC-Admin-02: a deactivated account is shut out."""
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.agent = get_user_model().objects.create_user(
+            username="leaver",
+            email="leaver@example.com",
+            password="not-a-real-password",
+        )
+        profile = self.agent.profile
+        profile.role = Role.SUPPORT_AGENT
+        profile.department = self.department
+        profile.save()
+
+        self.stayer = get_user_model().objects.create_user(
+            username="stayer",
+            email="stayer@example.com",
+            password="not-a-real-password",
+        )
+        stays = self.stayer.profile
+        stays.role = Role.SUPPORT_AGENT
+        stays.department = self.department
+        stays.save()
+
+        self.complaint = self.make_complaint(
+            assigned_department=self.department,
+            assigned_to=self.agent,
+        )
+
+    def login_as_leaver(self):
+        return self.client.post("/accounts/login/", {
+            "username": "leaver@example.com",
+            "password": "not-a-real-password",
+        })
+
+    def test_an_active_account_can_log_in(self):
+        """The control, so the refusal below means something."""
+        self.login_as_leaver()
+
+        self.assertEqual(
+            self.client.session.get("_auth_user_id"), str(self.agent.pk),
+        )
+
+    def test_a_deactivated_account_cannot_log_in(self):
+        self.agent.is_active = False
+        self.agent.save(update_fields=["is_active"])
+
+        self.login_as_leaver()
+
+        self.assertIsNone(self.client.session.get("_auth_user_id"))
+
+    def test_their_open_complaints_are_still_reassignable(self):
+        """The second half of the criterion, and the easier one to miss.
+
+        Shutting someone out is no use if their work becomes
+        unassignable with them.
+        """
+        self.agent.is_active = False
+        self.agent.save(update_fields=["is_active"])
+
+        candidates = eligible_agents(self.complaint)
+
+        self.assertIn(self.stayer, candidates)
+        self.assertNotIn(self.agent, candidates)
+
+        assign_complaint(
+            self.complaint, agent=self.stayer, actor=self.user,
+            reason="Previous agent deactivated.",
+        )
+
+        self.complaint.refresh_from_db()
+        self.assertEqual(self.complaint.assigned_to, self.stayer)
+
+    def test_a_deactivated_agent_is_not_offered_for_new_work(self):
+        self.agent.is_active = False
+        self.agent.save(update_fields=["is_active"])
+
+        fresh = self.make_complaint(assigned_department=self.department)
+
+        self.assertNotIn(self.agent, eligible_agents(fresh))
+
+    def test_roles_are_editable_from_the_admin(self):
+        """SCMS-F-024's 'change roles' half, through the real page."""
+        from .roles import Role
+
+        admin = get_user_model().objects.create_superuser(
+            username="root", email="root@example.com",
+            password="not-a-real-password",
+        )
+        self.client.force_login(admin)
+
+        response = self.client.get(
+            f"/admin/auth/user/{self.agent.pk}/change/",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        # The inline's own field, which is what makes the role
+        # editable from the user's page at all.
+        self.assertContains(response, "profile-0-role")
+
+        self.agent.profile.role = Role.DEPARTMENT_ADMIN
+        self.agent.profile.save()
+        self.agent.refresh_from_db()
+
+        self.assertEqual(
+            self.agent.profile.role, Role.DEPARTMENT_ADMIN,
+        )
+
+
+class DraftTests(BaseFixture):
+    """SCMS-F-010 / TC-Lodge-05: save, resume, and purge at 7 days."""
+
+    URL = "/new/"
+
+    def setUp(self):
+        super().setUp()
+        self.sub_category = SubCategory.objects.create(
+            name="Projector", code="projector", category=self.category,
+        )
+        self.client.force_login(self.user)
+
+    def save_draft_via_form(self, **overrides):
+        data = {
+            "title": "Projector flickers",
+            "description": "It flickers every few minutes.",
+            "location": "Room 302",
+            "category": str(self.category.pk),
+            "save_draft": "1",
+        }
+        data.update(overrides)
+
+        return self.client.post(self.URL, data)
+
+    def test_a_draft_is_saved_without_passing_validation(self):
+        """A draft is unfinished by definition."""
+        response = self.save_draft_via_form(
+            description="", location="", category="",
+        )
+
+        self.assertEqual(response.status_code, 302)
+
+        draft = ComplaintDraft.objects.get(user=self.user)
+        self.assertEqual(draft.title, "Projector flickers")
+        self.assertEqual(Complaint.objects.count(), 0)
+
+    def test_the_draft_is_filled_back_into_the_form(self):
+        self.save_draft_via_form()
+
+        page = self.client.get(self.URL)
+
+        self.assertContains(page, "Projector flickers")
+        self.assertContains(page, "Unfinished draft")
+
+    def test_saving_again_replaces_the_draft(self):
+        """One draft per person, not a folder of them."""
+        self.save_draft_via_form()
+        self.save_draft_via_form(title="Projector dead")
+
+        self.assertEqual(ComplaintDraft.objects.count(), 1)
+        self.assertEqual(
+            ComplaintDraft.objects.get().title, "Projector dead",
+        )
+
+    def test_a_draft_is_retrievable_before_seven_days(self):
+        draft = save_draft(self.user, title="Still here")
+        ComplaintDraft.objects.filter(pk=draft.pk).update(
+            updated_at=timezone.now() - timedelta(days=6),
+        )
+
+        self.assertEqual(purge_expired_drafts(), 0)
+        self.assertIsNotNone(get_draft(self.user))
+
+    def test_a_draft_is_gone_after_seven_days(self):
+        draft = save_draft(self.user, title="Too old")
+        ComplaintDraft.objects.filter(pk=draft.pk).update(
+            updated_at=timezone.now() - timedelta(days=8),
+        )
+
+        self.assertEqual(purge_expired_drafts(), 1)
+        self.assertIsNone(get_draft(self.user))
+
+    def test_the_window_runs_from_the_last_save(self):
+        """Editing yesterday must not expire because you began on day 1."""
+        draft = save_draft(self.user, title="Started long ago")
+        ComplaintDraft.objects.filter(pk=draft.pk).update(
+            created_at=timezone.now() - timedelta(days=30),
+            updated_at=timezone.now() - timedelta(days=1),
+        )
+
+        self.assertEqual(purge_expired_drafts(), 0)
+
+    def test_submitting_the_complaint_clears_the_draft(self):
+        self.save_draft_via_form()
+
+        self.client.post(self.URL, {
+            "title": "Projector flickers",
+            "description": "It flickers every few minutes.",
+            "location": "Room 302",
+            "category": str(self.category.pk),
+            "sub_category": str(self.sub_category.pk),
+        })
+
+        self.assertEqual(Complaint.objects.count(), 1)
+        self.assertIsNone(get_draft(self.user))
+
+    def test_a_draft_can_be_discarded(self):
+        self.save_draft_via_form()
+
+        self.client.post("/new/discard/")
+
+        self.assertIsNone(get_draft(self.user))
+
+    def test_a_draft_is_invisible_to_every_complaint_query(self):
+        """Why a draft is not a Complaint with a 'draft' status."""
+        self.save_draft_via_form()
+
+        self.assertEqual(Complaint.objects.count(), 0)
+
+    def test_the_purge_command_runs(self):
+        from io import StringIO
+        from django.core.management import call_command
+
+        draft = save_draft(self.user, title="Old")
+        ComplaintDraft.objects.filter(pk=draft.pk).update(
+            updated_at=timezone.now() - timedelta(days=9),
+        )
+        out = StringIO()
+
+        call_command("purge_expired_drafts", stdout=out)
+
+        self.assertIn("1 draft(s) purged", out.getvalue())
+
+
+class DuplicateDetectionTests(BaseFixture):
+    """SCMS-F-015 / TC-Route-05: flag, then let an agent judge."""
+
+    TEXT = (
+        "The projector in room 302 does not switch on at all. "
+        "I have tried both wall sockets and the remote."
+    )
+
+    def setUp(self):
+        super().setUp()
+        from .roles import Role
+
+        self.first = self.make_complaint(description=self.TEXT)
+        self.agent = get_user_model().objects.create_user(
+            username="dupagent", password="not-a-real-password",
+        )
+        profile = self.agent.profile
+        profile.role = Role.SUPPORT_AGENT
+        profile.department = self.department
+        profile.save()
+
+    def lodge_similar(self, text=None, **overrides):
+        return self.make_complaint(
+            description=text if text is not None else self.TEXT,
+            **overrides,
+        )
+
+    def test_a_near_identical_complaint_is_flagged(self):
+        second = self.lodge_similar(self.TEXT + " Still broken.")
+
+        flags = flag_duplicates(second)
+
+        self.assertEqual(len(flags), 1)
+        self.assertEqual(flags[0].similar_to, self.first)
+        self.assertGreaterEqual(flags[0].similarity, DUPLICATE_THRESHOLD)
+
+    def test_an_unrelated_complaint_is_not_flagged(self):
+        second = self.lodge_similar(
+            "The lift on the north side is making a grinding noise.",
+        )
+
+        self.assertEqual(flag_duplicates(second), [])
+
+    def test_case_and_spacing_do_not_defeat_the_match(self):
+        second = self.lodge_similar(f"  {self.TEXT.upper()}  ")
+
+        self.assertEqual(len(flag_duplicates(second)), 1)
+
+    def test_another_complainants_identical_text_is_not_a_duplicate(self):
+        """Two people can report the same broken projector."""
+        other = get_user_model().objects.create_user(
+            username="someone", password="not-a-real-password",
+        )
+        second = self.lodge_similar(submitted_by=other)
+
+        self.assertEqual(flag_duplicates(second), [])
+
+    def test_a_different_category_is_not_a_duplicate(self):
+        other_category = Category.objects.create(
+            name="Facilities", code="fac2",
+            department=self.department, sla_hours=24,
+        )
+        second = self.lodge_similar(category=other_category)
+
+        self.assertEqual(flag_duplicates(second), [])
+
+    def test_an_older_complaint_falls_outside_the_window(self):
+        Complaint.objects.filter(pk=self.first.pk).update(
+            created_at=timezone.now() - timedelta(
+                days=DUPLICATE_WINDOW_DAYS + 1,
+            ),
+        )
+        second = self.lodge_similar()
+
+        self.assertEqual(flag_duplicates(second), [])
+
+    def test_flagging_twice_does_not_duplicate_the_flag(self):
+        second = self.lodge_similar()
+
+        flag_duplicates(second)
+        flag_duplicates(second)
+
+        self.assertEqual(
+            DuplicateFlag.objects.filter(complaint=second).count(), 1,
+        )
+
+    def test_nothing_is_closed_or_merged_by_a_flag(self):
+        """The flag asks a question; it does not act."""
+        second = self.lodge_similar()
+        flag_duplicates(second)
+
+        second.refresh_from_db()
+        self.first.refresh_from_db()
+
+        self.assertEqual(second.status, Complaint.Status.OPEN)
+        self.assertEqual(self.first.status, Complaint.Status.OPEN)
+
+    def test_an_agent_can_confirm_a_flag(self):
+        second = self.lodge_similar()
+        second.assigned_to = self.agent
+        second.assigned_department = self.department
+        second.save(update_fields=["assigned_to", "assigned_department"])
+        flag = flag_duplicates(second)[0]
+
+        self.client.force_login(self.agent)
+        self.client.post(f"/duplicates/{flag.pk}/", {"verdict": "confirm"})
+
+        flag.refresh_from_db()
+        self.assertEqual(flag.verdict, DuplicateVerdict.CONFIRMED)
+        self.assertEqual(flag.reviewed_by, self.agent)
+        self.assertIsNotNone(flag.reviewed_at)
+
+    def test_an_agent_can_dismiss_a_flag(self):
+        second = self.lodge_similar()
+        second.assigned_to = self.agent
+        second.assigned_department = self.department
+        second.save(update_fields=["assigned_to", "assigned_department"])
+        flag = flag_duplicates(second)[0]
+
+        self.client.force_login(self.agent)
+        self.client.post(f"/duplicates/{flag.pk}/", {"verdict": "dismiss"})
+
+        flag.refresh_from_db()
+        self.assertEqual(flag.verdict, DuplicateVerdict.DISMISSED)
+
+    def test_a_flag_cannot_be_judged_twice(self):
+        second = self.lodge_similar()
+        flag = flag_duplicates(second)[0]
+        resolve_duplicate_flag(flag, actor=self.agent, confirmed=True)
+
+        with self.assertRaises(ValueError):
+            resolve_duplicate_flag(flag, actor=self.agent, confirmed=False)
+
+    def test_a_complainant_cannot_judge_a_flag(self):
+        second = self.lodge_similar()
+        flag = flag_duplicates(second)[0]
+
+        self.client.force_login(self.user)
+        response = self.client.post(
+            f"/duplicates/{flag.pk}/", {"verdict": "dismiss"},
+        )
+
+        self.assertEqual(response.status_code, 403)
+        flag.refresh_from_db()
+        self.assertEqual(flag.verdict, DuplicateVerdict.PENDING)
 
 
 class DashboardTests(RoleFixture):

@@ -4,6 +4,22 @@
 {% block title %}Submit Complaint | SCMS{% endblock %}
 
 {% block content %}
+{# SCMS-F-010 #}
+{% if draft %}
+<div class="card">
+    <h2>Unfinished draft</h2>
+    <p class="muted">
+        Saved {{ draft.updated_at|date:"d M Y, H:i" }}. Kept for
+        {{ draft_days }} days from the last save, then deleted.
+        The fields below have been filled in from it.
+    </p>
+    <form method="post" action="{% url 'complaints:draft_discard' %}">
+        {% csrf_token %}
+        <button type="submit" class="button">Discard draft</button>
+    </form>
+</div>
+{% endif %}
+
 <div class="card">
     <h1>Submit a Complaint</h1>
     <p class="muted">
@@ -38,6 +54,12 @@
 
         <button class="button" type="submit">
             Submit Complaint
+        </button>
+
+        {% comment %} SCMS-F-010. Same form, so whatever has been typed is what
+           gets saved; the view skips validation for this button. {% endcomment %}
+        <button class="button" type="submit" name="save_draft" value="1">
+            Save as draft
         </button>
 
         <a href="{% url 'complaints:my_complaints' %}">
