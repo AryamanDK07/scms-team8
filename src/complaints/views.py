@@ -15,6 +15,7 @@ from .forms import (
     ComplaintSearchForm,
     PriorityOverrideForm,
     RatingForm,
+    ReopenForm,
     ResolutionForm,
     StatusChangeForm,
 )
@@ -35,8 +36,10 @@ from .services import (
     comment_thread,
     offerable_transitions,
     override_priority,
+    may_reopen,
     priority_for,
     rate_complaint,
+    reopen_complaint,
     resolve_complaint,
     transition_status,
 )
@@ -160,6 +163,8 @@ def complaint_detail(request, reference_id):
             "comment_form": CommentForm(),
             "rating_form": RatingForm(),
             "can_rate": can_rate(complaint, request.user),
+            "reopen_form": ReopenForm(),
+            "can_reopen": may_reopen(complaint, request.user),
         },
     )
 
@@ -223,6 +228,8 @@ def complaint_comment_add(request, reference_id):
             "comment_form": form,
             "rating_form": RatingForm(),
             "can_rate": can_rate(complaint, request.user),
+            "reopen_form": ReopenForm(),
+            "can_reopen": may_reopen(complaint, request.user),
         },
     )
 
@@ -622,5 +629,65 @@ def complaint_rate(request, reference_id):
             "comment_form": CommentForm(),
             "rating_form": form,
             "can_rate": can_rate(complaint, request.user),
+            "reopen_form": ReopenForm(),
+            "can_reopen": may_reopen(complaint, request.user),
+        },
+    )
+
+
+@login_required
+def complaint_reopen(request, reference_id):
+    """Reopen a resolved complaint within its window (SCMS-F-019).
+
+    Access follows the complaint; reopen_complaint then decides
+    whether this user may reopen it now, so the rule lives in one
+    place rather than being restated here.
+    """
+    complaint = get_object_or_404(Complaint, reference_id=reference_id)
+
+    require_complaint_access(complaint, request.user)
+
+    if request.method != "POST":
+        return redirect(
+            "complaints:complaint_detail",
+            reference_id=complaint.reference_id,
+        )
+
+    form = ReopenForm(request.POST)
+    error = None
+
+    if form.is_valid():
+        try:
+            reopen_complaint(
+                complaint,
+                actor=request.user,
+                reason=form.cleaned_data["reason"],
+                source_ip=request.META.get("REMOTE_ADDR"),
+            )
+        except ValueError as problem:
+            error = str(problem)
+        else:
+            return redirect(
+                "complaints:complaint_detail",
+                reference_id=complaint.reference_id,
+            )
+
+    if error:
+        form.add_error(None, error)
+
+    history = complaint.status_history.select_related("changed_by").all()
+
+    return render(
+        request,
+        "complaints/complaint_detail.html",
+        {
+            "complaint": complaint,
+            "history": history,
+            "thread": comment_thread(complaint),
+            "comment_form": CommentForm(),
+            "rating_form": RatingForm(),
+            "can_rate": can_rate(complaint, request.user),
+            "reopen_form": form,
+            "can_reopen": False,
         },
     )

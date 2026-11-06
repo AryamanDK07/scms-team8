@@ -50,6 +50,11 @@ urlpatterns = [
         name="complaint_resolve",
     ),
     path(
+        "<ref:reference_id>/reopen/",
+        views.complaint_reopen,
+        name="complaint_reopen",
+    ),
+    path(
         "<ref:reference_id>/rate/",
         views.complaint_rate,
         name="complaint_rate",
