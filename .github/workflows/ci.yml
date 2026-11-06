@@ -174,3 +174,70 @@ jobs:
           else
             gh api "repos/$REPO/issues/$PR/comments" -F body=@figures.md
           fi
+
+  # SCMS-NF-006 (T8-41). The portability claim is that the system
+  # runs on Linux with Python 3.11+ and PostgreSQL 14+, deployable
+  # as containers. The test job above proves the Python and
+  # PostgreSQL halves; this one proves the container half, by
+  # building the image and starting the real stack rather than by
+  # asserting that a Dockerfile exists.
+  docker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t scms:ci .
+
+      - name: Refuse an image that runs as root
+        run: |
+          user=$(docker run --rm scms:ci whoami)
+          echo "container user: $user"
+          test "$user" = "scms"
+
+      - name: Start the stack
+        run: docker compose up -d --build
+
+      - name: Wait for the application to answer
+        run: |
+          for attempt in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' \
+              http://localhost:8000/accounts/login/ || true)
+
+            if [ "$code" = "200" ]; then
+              echo "login page answered 200 after ${attempt}0s"
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "the application never answered; logs follow"
+          docker compose logs --no-color
+          exit 1
+
+      - name: Migrate inside the container
+        run: docker compose exec -T app python manage.py migrate
+
+      - name: Smoke test the running stack
+        run: |
+          set -o pipefail
+
+          # The login page renders, which means Django, the
+          # templates and the database connection all work.
+          curl -sf http://localhost:8000/accounts/login/ \
+            | grep -q "SCMS Login"
+
+          # A page behind authentication redirects rather than
+          # erroring, which means the auth stack is wired up.
+          code=$(curl -s -o /dev/null -w '%{http_code}' \
+            http://localhost:8000/queue/)
+          test "$code" = "302"
+
+          echo "smoke test passed"
+
+      - name: Stop the stack
+        if: always()
+        run: docker compose down -v

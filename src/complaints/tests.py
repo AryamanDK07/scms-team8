@@ -1,4 +1,5 @@
 import csv
+import json
 import logging
 import re
 import shutil
@@ -38,6 +39,12 @@ from .models import (
     SecurityEventType,
     SubCategory,
     UserProfile,
+)
+from .retention import (
+    RETENTION_DAYS,
+    archive_expired,
+    expired_complaints,
+    purge_is_available_to_the_application,
 )
 from .ratelimit import (
     LOGIN_LIMIT,
@@ -3294,6 +3301,201 @@ class ObjectLevelAccessTests(RoleFixture):
         orphan.profile.delete()
         orphan.refresh_from_db()
         self.assertFalse(can_view_complaint(orphan, self.complaint))
+
+
+class RetentionTests(BaseFixture):
+    """SCMS-NF-007 / TC-Audit-02: three years, archive, then purge.
+
+    The interesting part of this requirement is that its second
+    half cannot be done by the application, and these tests say so
+    rather than leaving it to be discovered.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.archive_dir = tempfile.mkdtemp()
+        self.old = self.make_complaint(title="Ancient fault")
+        self.recent = self.make_complaint(title="Recent fault")
+
+        Complaint.objects.filter(pk=self.old.pk).update(
+            created_at=timezone.now() - timedelta(days=RETENTION_DAYS + 1),
+        )
+        self.old.refresh_from_db()
+
+        ComplaintStatusHistory.objects.create(
+            complaint=self.old,
+            old_status="",
+            new_status=self.old.status,
+            field_name="status",
+            old_value="",
+            new_value="Open",
+            changed_by=self.user,
+            source_ip="127.0.0.1",
+            comment="Lodged long ago.",
+        )
+
+    def tearDown(self):
+        shutil.rmtree(self.archive_dir, ignore_errors=True)
+        super().tearDown()
+
+    def archive_path(self):
+        return str(Path(self.archive_dir) / "archive.json")
+
+    def test_only_records_past_three_years_are_expired(self):
+        expired = list(expired_complaints())
+
+        self.assertEqual(expired, [self.old])
+
+    def test_the_archive_holds_the_record_and_its_audit_trail(self):
+        count, path = archive_expired(self.archive_path())
+
+        self.assertEqual(count, 1)
+
+        payload = json.loads(Path(path).read_text())
+        record = payload["complaints"][0]
+
+        self.assertEqual(record["reference_id"], self.old.reference_id)
+        self.assertEqual(record["title"], "Ancient fault")
+        self.assertEqual(len(record["audit_trail"]), 1)
+        self.assertEqual(
+            record["audit_trail"][0]["comment"], "Lodged long ago.",
+        )
+        self.assertEqual(
+            record["audit_trail"][0]["changed_by"],
+            self.user.get_username(),
+        )
+
+    def test_archiving_deletes_nothing(self):
+        """The archive and the purge are separate acts, on purpose."""
+        archive_expired(self.archive_path())
+
+        self.old.refresh_from_db()
+        self.assertTrue(
+            Complaint.objects.filter(pk=self.old.pk).exists(),
+        )
+        self.assertEqual(self.old.status_history.count(), 1)
+
+    def test_a_recent_complaint_is_left_out_of_the_archive(self):
+        _, path = archive_expired(self.archive_path())
+
+        payload = json.loads(Path(path).read_text())
+        references = [c["reference_id"] for c in payload["complaints"]]
+
+        self.assertNotIn(self.recent.reference_id, references)
+
+    def test_the_application_cannot_purge_the_audit_trail(self):
+        """SCMS-NF-007 against SCMS-SR-006, demonstrated.
+
+        An audit trail the application can erase on a timer is not
+        an audit trail, so this failure is the correct behaviour,
+        not a defect. It is asserted here so that anyone who later
+        gives the application a delete path has to come past this
+        test and justify it.
+        """
+        with self.assertRaises(ValueError) as caught:
+            self.old.status_history.all().delete()
+
+        self.assertIn("append-only", str(caught.exception))
+
+    def test_the_application_cannot_purge_the_complaint_either(self):
+        """Its audit rows PROTECT it, which is the same guarantee."""
+        from django.db.models import ProtectedError
+
+        with self.assertRaises(ProtectedError):
+            self.old.delete()
+
+    def test_the_module_states_that_the_purge_is_not_its_job(self):
+        self.assertFalse(purge_is_available_to_the_application())
+
+    def test_the_privileged_purge_script_exists_and_restores_the_guard(self):
+        """The half a DBA runs, checked for the step people forget.
+
+        A purge script that drops the append-only trigger and does
+        not put it back leaves the audit trail unprotected from
+        then on, and nothing would notice until someone looked.
+        """
+        script = (
+            Path(settings.BASE_DIR).parent / "deploy" / "purge_archived.sql"
+        )
+
+        self.assertTrue(script.exists(), "the purge script is missing")
+
+        body = script.read_text()
+
+        self.assertIn("DROP TRIGGER", body)
+        self.assertIn("CREATE TRIGGER", body)
+        self.assertLess(
+            body.index("DROP TRIGGER"),
+            body.index("CREATE TRIGGER"),
+            "the trigger is recreated before it is dropped",
+        )
+        self.assertIn("ROLLBACK", body)
+
+    def test_the_command_archives_and_says_nothing_was_deleted(self):
+        from io import StringIO
+        from django.core.management import call_command
+
+        out = StringIO()
+
+        call_command(
+            "archive_expired_complaints", self.archive_path(), stdout=out,
+        )
+
+        output = out.getvalue()
+        self.assertIn("1 complaint(s) archived", output)
+        self.assertIn("Nothing was deleted", output)
+        self.assertIn("purge_archived.sql", output)
+
+
+class DockerImageTests(TestCase):
+    """SCMS-NF-006 / TC-Port-01: what the image promises.
+
+    CI builds the image and starts the stack, which is the real
+    proof. These are the claims worth pinning in the repository
+    itself, so a change to the Dockerfile that quietly undoes one
+    fails here rather than in a deployment.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        root = Path(settings.BASE_DIR).parent
+        cls.dockerfile = (root / "Dockerfile").read_text()
+        cls.compose = (root / "docker-compose.yml").read_text()
+
+        # Comments are stripped for the checks below. The first
+        # version of test_the_image_does_not_serve_with_the_
+        # development_server failed on the comment that explains
+        # why runserver is NOT used, which is the opposite of what
+        # it meant to catch.
+        cls.instructions = "\n".join(
+            line for line in cls.dockerfile.splitlines()
+            if not line.lstrip().startswith("#")
+        )
+
+    def test_the_container_does_not_run_as_root(self):
+        self.assertIn("USER scms", self.instructions)
+
+    def test_the_image_does_not_serve_with_the_development_server(self):
+        """runserver is single-threaded and not for production."""
+        self.assertIn("gunicorn", self.instructions)
+        self.assertNotIn("runserver", self.instructions)
+
+    def test_the_python_version_matches_what_the_sad_commits_to(self):
+        self.assertIn("python:3.11", self.dockerfile)
+
+    def test_postgres_is_the_version_ci_tests_against(self):
+        self.assertIn("postgres:14", self.compose)
+
+    def test_uploaded_evidence_survives_the_container(self):
+        """SCMS-SR-005 files are not disposable with the process."""
+        self.assertIn("private-media", self.dockerfile)
+        self.assertIn("scms-media", self.compose)
+
+    def test_the_application_waits_for_a_healthy_database(self):
+        """Without this the first migrate races the database."""
+        self.assertIn("service_healthy", self.compose)
+        self.assertIn("pg_isready", self.compose)
 
 
 class TemplateCommentLeakTests(BaseFixture):

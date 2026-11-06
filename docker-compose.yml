@@ -1,0 +1,47 @@
+# SCMS, as it is meant to be deployed (SCMS-NF-006).
+#
+#   docker compose up --build
+#   docker compose exec app python manage.py migrate
+#   docker compose exec app python manage.py createsuperuser
+#
+# The application connects to PostgreSQL 14, which is the version
+# CI tests against, so what runs here is what the suite proved.
+
+services:
+  db:
+    image: postgres:14
+    environment:
+      POSTGRES_DB: scms_db
+      POSTGRES_USER: scms_user
+      POSTGRES_PASSWORD: change-me-before-deploying
+    volumes:
+      - scms-db:/var/lib/postgresql/data
+    healthcheck:
+      # The application waits for this rather than for the
+      # container to exist: postgres accepts connections a little
+      # after it starts, and without the wait the first migrate
+      # fails with a confusing connection error.
+      test: ["CMD-SHELL", "pg_isready -U scms_user -d scms_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DB_NAME: scms_db
+      DB_USER: scms_user
+      DB_PASSWORD: change-me-before-deploying
+      DB_HOST: db
+      DB_PORT: "5432"
+    ports:
+      - "8000:8000"
+    volumes:
+      - scms-media:/app/private-media
+
+volumes:
+  scms-db:
+  scms-media:
