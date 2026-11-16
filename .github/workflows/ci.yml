@@ -154,8 +154,17 @@ jobs:
       # anyone whether the PostgreSQL-only tests from T8-48 ran or
       # silently skipped. Posting the same figures as a comment puts
       # them where both a reviewer and a tool can read them.
+      #
+      # PRs from external forks do not get write access to the base repo's
+      # issue comments via GITHUB_TOKEN, which causes the 403 below. Skip
+      # that comment step for forked PRs so the CI job still reflects the
+      # actual test result rather than failing on a GitHub permission error.
       - name: Report the figures on the pull request
-        if: always() && github.event_name == 'pull_request'
+        if: >
+          always() &&
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.fork == false
+        continue-on-error: true
         working-directory: src
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
