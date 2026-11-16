@@ -148,6 +148,9 @@ jobs:
 
           cat figures.md >> "$GITHUB_STEP_SUMMARY"
 
+      # Fork PRs receive a read-only GITHUB_TOKEN, so commenting would
+      # fail with HTTP 403. The job summary above still records the
+      # test and coverage figures for those runs.
       # The summary page above is for a person with a browser. It is
       # not readable through the API -- a check run reports its
       # output.summary as null -- so a green tick alone cannot tell
