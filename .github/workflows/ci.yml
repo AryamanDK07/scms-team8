@@ -148,14 +148,14 @@ jobs:
 
           cat figures.md >> "$GITHUB_STEP_SUMMARY"
 
-      # The summary page above is for a person with a browser. It is
-      # not readable through the API -- a check run reports its
-      # output.summary as null -- so a green tick alone cannot tell
-      # anyone whether the PostgreSQL-only tests from T8-48 ran or
-      # silently skipped. Posting the same figures as a comment puts
-      # them where both a reviewer and a tool can read them.
+      # Fork PRs receive a read-only GITHUB_TOKEN, so commenting would
+      # fail with HTTP 403. The job summary above still records the
+      # test and coverage figures for those runs.
       - name: Report the figures on the pull request
-        if: always() && github.event_name == 'pull_request'
+        if: >
+          always() &&
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.fork == false
         working-directory: src
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
